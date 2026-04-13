@@ -43,7 +43,7 @@ void main(uint3 threadIdx : SV_DispatchThreadID)  // SV_DispatchThreadID gives u
     
     // Access the vertex buffer using buffer device address
     // Note: This is using Vulkan's VK_KHR_buffer_device_address extension
-    // allowing direct pointer access to GPU buffers
+    // Cast the uint64 address to a typed pointer for direct GPU buffer access
     Vertex* vertices = (Vertex*)pushConst.bufferAddress;
     
     // Calculate a unique rotation angle for each vertex

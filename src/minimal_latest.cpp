@@ -314,8 +314,8 @@ struct Image
 -*/
 struct ImageResource : Image
 {
-  VkImageView   view{};    // Image view
   VkExtent2D    extent{};  // Size of the image
+  VkFormat      format{};  // Format of the image (e.g. VK_FORMAT_R8G8B8A8_UNORM)
   VkImageLayout layout{};  // Layout of the image (color attachment, shader read, ...)
 };
 
@@ -341,6 +341,19 @@ struct QueueInfo
   uint32_t queueIndex  = ~0U;  // Index of the queue in the family
   VkQueue  queue{};            // The queue object
 };
+
+/*--
+ * Aligns a value up to the next multiple of the alignment.
+ * If the alignment is 0, it returns the original value.
+ */
+VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment)
+{
+  if(alignment == 0)
+  {
+    return value;
+  }
+  return ((value + alignment - 1) / alignment) * alignment;
+}
 
 /*-- 
  * Combines hash values using the FNV-1a based algorithm 
@@ -1601,8 +1614,9 @@ public:
    */
   Buffer createBuffer(VkDeviceSize             size,
                       VkBufferUsageFlags2KHR   usage,
-                      VmaMemoryUsage           memoryUsage = VMA_MEMORY_USAGE_AUTO,
-                      VmaAllocationCreateFlags flags       = {}) const
+                      VmaMemoryUsage           memoryUsage  = VMA_MEMORY_USAGE_AUTO,
+                      VmaAllocationCreateFlags flags        = {},
+                      VkDeviceSize             minAlignment = {}) const
   {
     // This can be used only with maintenance5
     const VkBufferUsageFlags2CreateInfoKHR bufferUsageFlags2CreateInfo{
@@ -1628,7 +1642,8 @@ public:
     // Create the buffer
     Buffer            resultBuffer;
     VmaAllocationInfo allocInfoOut{};
-    VK_CHECK(vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &resultBuffer.buffer, &resultBuffer.allocation, &allocInfoOut));
+    VK_CHECK(vmaCreateBufferWithAlignment(m_allocator, &bufferInfo, &allocInfo, minAlignment, &resultBuffer.buffer,
+                                          &resultBuffer.allocation, &allocInfoOut));
 
     // Get the GPU address of the buffer
     const VkBufferDeviceAddressInfo info = {.sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
@@ -1687,14 +1702,19 @@ public:
    * the staging buffer can be cleared using the freeStagingBuffers function.
   -*/
   template <typename T>
-  Buffer createBufferAndUploadData(VkCommandBuffer cmd, const std::span<T>& vectorData, VkBufferUsageFlags2KHR usageFlags)
+  Buffer createBufferAndUploadData(VkCommandBuffer          cmd,
+                                   const std::span<T>&      vectorData,
+                                   VkBufferUsageFlags2KHR   usageFlags,
+                                   VmaAllocationCreateFlags flags        = {},
+                                   VkDeviceSize             minAlignment = {})
   {
     // Create staging buffer and upload data
     Buffer stagingBuffer = createStagingBuffer(vectorData);
 
     // Create the final buffer in GPU memory
     const VkDeviceSize bufferSize = sizeof(T) * vectorData.size();
-    Buffer buffer = createBuffer(bufferSize, usageFlags | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR, VMA_MEMORY_USAGE_GPU_ONLY);
+    Buffer             buffer     = createBuffer(bufferSize, usageFlags | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR,
+                                                 VMA_MEMORY_USAGE_GPU_ONLY, flags, minAlignment);
 
     const std::array<VkBufferCopy, 1> copyRegion{{{.size = bufferSize}}};
     vkCmdCopyBuffer(cmd, stagingBuffer.buffer, buffer.buffer, uint32_t(copyRegion.size()), copyRegion.data());
@@ -1720,11 +1740,7 @@ public:
   /*-- Destroy image --*/
   void destroyImage(Image& image) const { vmaDestroyImage(m_allocator, image.image, image.allocation); }
 
-  void destroyImageResource(ImageResource& imageRessource) const
-  {
-    destroyImage(imageRessource);
-    vkDestroyImageView(m_device, imageRessource.view, nullptr);
-  }
+  void destroyImageResource(ImageResource& imageRessource) const { destroyImage(imageRessource); }
 
   /*-- Create an image and upload data using a staging buffer --*/
   template <typename T>
@@ -1828,6 +1844,50 @@ public:
     }
   }
 
+  // Descriptor heap variant: returns a deduplicated heap index for a given VkSamplerCreateInfo.
+  // Identical create-infos share the same index (ref-counted).
+  uint32_t acquireSamplerDescriptor(const VkSamplerCreateInfo& createInfo)
+  {
+    if(auto it = m_descriptorMap.find(createInfo); it != m_descriptorMap.end())
+    {
+      ++it->second.refCount;
+      return it->second.index;
+    }
+
+    uint32_t newIndex{};
+    if(!m_freeDescriptorIndices.empty())
+    {
+      newIndex = m_freeDescriptorIndices.back();
+      m_freeDescriptorIndices.pop_back();
+    }
+    else
+    {
+      newIndex = m_nextDescriptorIndex++;
+    }
+
+    m_descriptorMap[createInfo]      = {newIndex, 1};
+    m_descriptorReverseMap[newIndex] = createInfo;
+    return newIndex;
+  }
+
+  // Release a previously acquired descriptor heap index.
+  // When the last reference is released, the index is recycled for future use.
+  void releaseSamplerDescriptor(uint32_t index)
+  {
+    auto revIt = m_descriptorReverseMap.find(index);
+    ASSERT(revIt != m_descriptorReverseMap.end(), "releaseSamplerDescriptor: unknown index");
+
+    auto fwdIt = m_descriptorMap.find(revIt->second);
+    ASSERT(fwdIt != m_descriptorMap.end(), "releaseSamplerDescriptor: inconsistent state");
+
+    if(--fwdIt->second.refCount == 0)
+    {
+      m_descriptorMap.erase(fwdIt);
+      m_descriptorReverseMap.erase(revIt);
+      m_freeDescriptorIndices.push_back(index);
+    }
+  }
+
 private:
   VkDevice m_device{};
 
@@ -1866,6 +1926,17 @@ private:
 
   // Stores unique samplers with their corresponding VkSamplerCreateInfo
   std::unordered_map<VkSamplerCreateInfo, VkSampler, SamplerCreateInfoHash, SamplerCreateInfoEqual> m_samplerMap;
+
+  // --- Descriptor heap index management ---
+  struct DescriptorEntry
+  {
+    uint32_t index{};
+    uint32_t refCount{};
+  };
+  std::unordered_map<VkSamplerCreateInfo, DescriptorEntry, SamplerCreateInfoHash, SamplerCreateInfoEqual> m_descriptorMap;
+  std::unordered_map<uint32_t, VkSamplerCreateInfo> m_descriptorReverseMap;
+  std::vector<uint32_t>                             m_freeDescriptorIndices;
+  uint32_t                                          m_nextDescriptorIndex = 0;
 
   // Internal function to create a new VkSampler
   const VkSampler createSampler(const VkSamplerCreateInfo& createInfo) const
@@ -2330,6 +2401,12 @@ private:
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unifiedImageLayoutsFeature{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR};
+    // Descriptor heap replaces traditional descriptor sets/pools with GPU buffer-based bindless descriptors.
+    // Samplers and images are written into heap buffers and accessed by index in the shaders.
+    VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeapFeatures{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
+    // Untyped pointers: required by descriptor heap
+    VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untypedPtrFeatures{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR};
 
     // Configure Vulkan context with required and optional extensions
     utils::ContextCreateInfo contextConfig;
@@ -2338,6 +2415,8 @@ private:
     contextConfig.deviceExtensions.push_back({VK_KHR_SWAPCHAIN_EXTENSION_NAME, true, nullptr});
     contextConfig.deviceExtensions.push_back({VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME, false, &unifiedImageLayoutsFeature});  // For VK_IMAGE_LAYOUT_GENERAL usage
     contextConfig.deviceExtensions.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, true, &dynamicState3Features});
+    contextConfig.deviceExtensions.push_back({VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME, true, &descriptorHeapFeatures});  // Bindless descriptor heap for textures and samplers
+    contextConfig.deviceExtensions.push_back({VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME, true, &untypedPtrFeatures});  // Required by bindless
 
     // Create the Vulkan context with configuration
     m_context.init(contextConfig);
@@ -2368,8 +2447,8 @@ private:
     // Create what is needed to submit the scene for each frame in-flight
     createFrameSubmission(m_swapchain.getMaxFramesInFlight());
 
-    // Create a descriptor pool for creating descriptor set in the application
-    createDescriptorPool();
+    // Create a descriptor pool for ImGui (it still needs a traditional pool for its own textures)
+    createUIDescriptorPool();
 
     // Initializing Dear ImGui
     initImGui();
@@ -2397,8 +2476,8 @@ private:
       utils::endSingleTimeCommands(cmd, m_context.getDevice(), m_transientCmdPool, m_context.getGraphicsQueue().queue);
     }
 
-    // Create how resources are passed to the pipeline
-    createGraphicDescriptorSet();
+    // With descriptor heap, the graphics pipeline layout is VK_NULL_HANDLE (no descriptor set layouts,
+    // no push constant ranges). All data is passed via vkCmdPushDataEXT and the descriptor heap.
 
     // Create graphics rendering pipeline
     createGraphicsPipeline();
@@ -2428,18 +2507,22 @@ private:
       filename = utils::findFile("image2.jpg", searchPaths);
       ASSERT(!filename.empty(), "Could not load texture image!");
       m_image[1] = loadAndCreateImage(cmd, filename);
+
+      // Create the descriptor heap buffers (sampler + resource) and upload them to the GPU.
+      // This must happen after images are loaded, since the heap references the VkImage handles.
+      createDescriptorHeap(cmd);
+
       utils::endSingleTimeCommands(cmd, m_context.getDevice(), m_transientCmdPool, m_context.getGraphicsQueue().queue);
     }
     m_allocator.freeStagingBuffers();  // Data is uploaded, staging buffers can be released
 
-    // Create a buffer (UBO) to store the scene information
+    // Create a buffer to store the scene information, updated once per frame via vkCmdUpdateBuffer.
+    // The shader accesses it through its buffer device address (BDA), not a descriptor set.
     m_sceneInfoBuffer = m_allocator.createBuffer(sizeof(shaderio::SceneInfo),
-                                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                                                     | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                                                  VMA_MEMORY_USAGE_GPU_ONLY);
     DBG_VK_NAME(m_sceneInfoBuffer.buffer);
-
-    // The image was loaded, now write its information, such that the graphic pipeline knows how to access it
-    updateGraphicsDescriptorSet();
   }
 
   /*--
@@ -2457,19 +2540,14 @@ private:
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
 
-    vkFreeDescriptorSets(device, m_descriptorPool, 1, &m_textureDescriptorSet);
-
     vkDestroyPipeline(device, m_computePipeline, nullptr);
     vkDestroyPipeline(device, m_graphicsPipelineWithTexture, nullptr);
     vkDestroyPipeline(device, m_graphicsPipelineWithoutTexture, nullptr);
-    vkDestroyPipelineLayout(device, m_graphicPipelineLayout, nullptr);
+    // No graphics pipeline layout to destroy (VK_NULL_HANDLE with descriptor heap)
     vkDestroyPipelineLayout(device, m_computePipelineLayout, nullptr);
     vkDestroyCommandPool(device, m_transientCmdPool, nullptr);
     vkDestroySurfaceKHR(m_context.getInstance(), m_surface, nullptr);
-    vkDestroyDescriptorSetLayout(device, m_textureDescriptorSetLayout, nullptr);
-    vkDestroyDescriptorSetLayout(device, m_graphicDescriptorSetLayout, nullptr);
-    vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
-    vkDestroyDescriptorPool(device, m_uiDescriptorPool, nullptr);
+    vkDestroyDescriptorPool(device, m_uiDescriptorPool, nullptr);  // ImGui descriptor pool
 
     // Frame info
     for(size_t i = 0; i < m_frameData.size(); i++)
@@ -2481,7 +2559,9 @@ private:
 
     m_allocator.destroyBuffer(m_vertexBuffer);
     m_allocator.destroyBuffer(m_pointsBuffer);
-    m_allocator.destroyBuffer(m_sceneInfoBuffer);
+    m_allocator.destroyBuffer(m_sceneInfoBuffer);     // Scene info GPU buffer (accessed via BDA)
+    m_allocator.destroyBuffer(m_samplerHeapBuffer);   // Descriptor heap: sampler GPU buffer
+    m_allocator.destroyBuffer(m_resourceHeapBuffer);  // Descriptor heap: resource (image) GPU buffer
     m_allocator.destroyImageResource(m_image[0]);
     m_allocator.destroyImageResource(m_image[1]);
 
@@ -2828,7 +2908,9 @@ private:
   }
 
   /*-- 
-   * The update of scene information buffer (UBO)
+   * Update the scene information buffer (GPU-side) once per frame.
+   * The buffer is accessed in the shader via its buffer device address (BDA).
+   * This keeps per-frame data in GPU memory, avoiding redundant push data transfers.
   -*/
   void updateSceneBuffer(VkCommandBuffer cmd) const
   {
@@ -2844,13 +2926,14 @@ private:
     sceneInfo.texId                 = m_imageID;
 
     // Add a barrier to make sure nothing was writing to it, before updating its content
-    utils::cmdBufferMemoryBarrier(cmd, m_sceneInfoBuffer.buffer, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+    utils::cmdBufferMemoryBarrier(cmd, m_sceneInfoBuffer.buffer,
+                                  VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                                   VK_PIPELINE_STAGE_2_TRANSFER_BIT);
     // Update the buffer with the new data
     vkCmdUpdateBuffer(cmd, m_sceneInfoBuffer.buffer, 0, sizeof(shaderio::SceneInfo), &sceneInfo);
-    // Add barrier to make sure the buffer is updated before the fragment shader uses it
+    // Add barrier to make sure the buffer is updated before the shaders use it
     utils::cmdBufferMemoryBarrier(cmd, m_sceneInfoBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+                                  VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
   }
 
   /*--
@@ -2860,47 +2943,29 @@ private:
   {
     DBG_VK_SCOPE(cmd);  // <-- Helps to debug in NSight
 
-    // Update the scene buffer, this cannot be done in between dynamic rendering
+    // Update the scene buffer once per frame (cannot be done inside dynamic rendering)
     updateSceneBuffer(cmd);
 
     const VkDeviceSize offsets[] = {0};
     const VkViewport   viewport{0.0F, 0.0F, float(m_viewportSize.width), float(m_viewportSize.height), 0.0F, 1.0F};
     const VkRect2D     scissor{{0, 0}, m_viewportSize};
 
-    // Setting up push descriptor information, we could choose dynamically the buffer to work on
-    const VkDescriptorBufferInfo bufferInfo = {.buffer = m_sceneInfoBuffer.buffer, .offset = 0, .range = VK_WHOLE_SIZE};
-    const std::array<VkWriteDescriptorSet, 1> writeDescriptorSet = {{{
-        .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet          = nullptr,                   // Not set, this is a push descriptor
-        .dstBinding      = shaderio::LBindSceneInfo,  // layout(binding = 0) in the fragment shader
-        .dstArrayElement = 0,                         // If we were to use an array of images
-        .descriptorCount = 1,
-        .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo     = &bufferInfo,
-    }}};
+    /*--
+     * Prepare push data: with descriptor heap, the pipeline layout is VK_NULL_HANDLE so we cannot
+     * use traditional push constants or push descriptors. Instead, vkCmdPushDataEXT sends small
+     * per-draw data to the shader's push_constant block. Push data carries only:
+     *   - The buffer device address of the SceneInfo buffer (updated once per frame above)
+     *   - The per-draw triangle color (changes between draw calls)
+     * The shader reads SceneInfo from GPU memory via buffer reference, keeping push data small.
+    -*/
+    shaderio::GraphicsPushData pushData{};
+    pushData.sceneInfoAddress = m_sceneInfoBuffer.address;  // Points to the GPU buffer updated above
 
-    // Push layout information with updated data
-    const VkPushDescriptorSetInfo pushDescriptorSetInfo{
-        .sType      = VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO,
-        .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
-        .layout     = m_graphicPipelineLayout,
-        .set        = shaderio::LSetScene,  // <--- Second set layout(set=1, binding=...) in the fragment shader
-        .descriptorWriteCount = uint32_t(writeDescriptorSet.size()),
-        .pDescriptorWrites    = writeDescriptorSet.data(),
-    };
-    // This is a push descriptor, allowing synchronization and dynamically changing data
-    vkCmdPushDescriptorSet2(cmd, &pushDescriptorSetInfo);
-
-
-    // Push constant information, see usage later
-    shaderio::PushConstant    pushValues{};
-    const VkPushConstantsInfo pushInfo{
-        .sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
-        .layout     = m_graphicPipelineLayout,
-        .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
-        .offset     = 0,
-        .size       = sizeof(shaderio::PushConstant),
-        .pValues    = &pushValues,
+    // VkPushDataInfoEXT describes where in push_constant space to write and the CPU data to upload
+    VkPushDataInfoEXT pushDataInfo{
+        .sType  = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
+        .offset = 0,
+        .data   = {.address = &pushData, .size = sizeof(shaderio::GraphicsPushData)},
     };
 
     // Image to render to
@@ -2940,35 +3005,40 @@ private:
     vkCmdSetViewportWithCount(cmd, 1, &viewport);
     vkCmdSetScissorWithCount(cmd, 1, &scissor);
 
-    /*-- 
-     * Binding the resources passed to the shader, using the descriptor set (holds the texture) 
-     * There are two descriptor layouts, one for the texture and one for the scene information,
-     * but only the texture is a set, the scene information is a push descriptor.
-    -*/
-    const VkBindDescriptorSetsInfo bindDescriptorSetsInfo = {
-        .sType              = VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO,
-        .stageFlags         = VK_SHADER_STAGE_ALL_GRAPHICS,
-        .layout             = m_graphicPipelineLayout,
-        .firstSet           = 0,
-        .descriptorSetCount = 1,
-        .pDescriptorSets    = &m_textureDescriptorSet,
+    // Bind the descriptor heap buffers so shaders can access textures and samplers by index.
+    // This replaces the traditional vkCmdBindDescriptorSets2 call that was used for the texture descriptor set.
+    // The sampler heap provides sampler descriptors (linear, nearest, etc.) and the resource heap provides image descriptors (loaded textures).
+    // Each VkBindHeapInfoEXT describes the heap buffer address, total size, and where the mandatory reserved range sits within the buffer.
+    const VkBindHeapInfoEXT samplerHeapBind{
+        .sType               = VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT,
+        .heapRange           = {m_samplerHeapBuffer.address, m_samplerHeapSize},
+        .reservedRangeOffset = m_samplerReservedOffset,
+        .reservedRangeSize   = m_samplerReservedSize,
     };
-    vkCmdBindDescriptorSets2(cmd, &bindDescriptorSetsInfo);
+    vkCmdBindSamplerHeapEXT(cmd, &samplerHeapBind);
+
+    const VkBindHeapInfoEXT resourceHeapBind{
+        .sType               = VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT,
+        .heapRange           = {m_resourceHeapBuffer.address, m_resourceHeapSize},
+        .reservedRangeOffset = m_resourceReservedOffset,
+        .reservedRangeSize   = m_resourceReservedSize,
+    };
+    vkCmdBindResourceHeapEXT(cmd, &resourceHeapBind);
 
     // Binding the Buffer containing all our Vertex
     vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, offsets);
 
-    // Push constant is information that is passed to the shader at each draw call.
-    pushValues.color = glm::vec3(1, 0, 0);
-    vkCmdPushConstants2(cmd, &pushInfo);
+    // Push data for the first triangle (red, no texture)
+    pushData.color = glm::vec3(1, 0, 0);
+    vkCmdPushDataEXT(cmd, &pushDataInfo);  // Send all push data to the shader
 
     // Draw the first triangle without texture (pipeline with specialization constant set to false)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipelineWithoutTexture);
     vkCmdDraw(cmd, 3, 1, 0, 0);  // 3 vertices, 1 instance, 0 offset
 
-    // Push constant again, with different information
-    pushValues.color = glm::vec3(0, 1, 0);
-    vkCmdPushConstants2(cmd, &pushInfo);
+    // Push data again with different color for the second triangle (green, with texture)
+    pushData.color = glm::vec3(0, 1, 0);
+    vkCmdPushDataEXT(cmd, &pushDataInfo);  // Re-send with updated color
 
     // Draw the second triangle with texture
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipelineWithTexture);
@@ -3116,29 +3186,9 @@ private:
         .pAttachments    = &colorBlendAttachment,
     };
 
-    // Push constant is used to pass data to the shader at each frame
-    const VkPushConstantRange pushConstantRange{
-        .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
-        .offset     = 0,
-        .size       = sizeof(shaderio::PushConstant),
-    };
-
-    // The two layout to use
-    const std::array<VkDescriptorSetLayout, 2> descriptorSetLayouts = {{
-        m_textureDescriptorSetLayout,  // All application textures
-        m_graphicDescriptorSetLayout,  // The scene information, and more eventually
-    }};
-
-    // The pipeline layout is used to pass data to the pipeline, anything with "layout" in the shader
-    const VkPipelineLayoutCreateInfo pipelineLayoutInfo{
-        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount         = uint32_t(descriptorSetLayouts.size()),
-        .pSetLayouts            = descriptorSetLayouts.data(),  // The descriptor set layout
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges    = &pushConstantRange,
-    };
-    VK_CHECK(vkCreatePipelineLayout(m_context.getDevice(), &pipelineLayoutInfo, nullptr, &m_graphicPipelineLayout));
-    DBG_VK_NAME(m_graphicPipelineLayout);
+    // With descriptor heap + push data, the graphics pipeline layout is VK_NULL_HANDLE.
+    // The spec requires layout = VK_NULL_HANDLE when VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT is set.
+    // All shader data is provided via vkCmdPushDataEXT (push data) and descriptor heap bindings.
 
     // Dynamic rendering: provide what the pipeline will render to
     const std::array<VkFormat, 1>       imageFormats = {{
@@ -3159,10 +3209,19 @@ private:
         .depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL,
     };
 
+    // Tell the pipeline that shaders will access descriptors via the descriptor heap.
+    // This flag is required when using VK_EXT_descriptor_heap with traditional pipelines
+    // (equivalent to VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT for shader objects).
+    const VkPipelineCreateFlags2CreateInfoKHR pipelineFlags2{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
+        .pNext = &dynamicRenderingInfo,
+        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT,
+    };
+
     // The pipeline is created with all the information
     const VkGraphicsPipelineCreateInfo pipelineInfo = {
         .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext               = &dynamicRenderingInfo,  // Use the modern flags2 structure
+        .pNext               = &pipelineFlags2,  // Chains: flags2 -> dynamicRendering
         .stageCount          = uint32_t(shaderStages.size()),
         .pStages             = shaderStages.data(),
         .pVertexInputState   = &vertexInputInfo,
@@ -3173,18 +3232,19 @@ private:
         .pDepthStencilState  = &depthStateInfo,
         .pColorBlendState    = &colorBlendingInfo,
         .pDynamicState       = &dynamicStateInfo,
-        .layout              = m_graphicPipelineLayout,
+        .layout              = VK_NULL_HANDLE,  // Required by VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT
     };
     VK_CHECK(vkCreateGraphicsPipelines(m_context.getDevice(), nullptr, 1, &pipelineInfo, nullptr, &m_graphicsPipelineWithTexture));
     DBG_VK_NAME(m_graphicsPipelineWithTexture);
 
     /*-- 
-     * Create pipeline without texture
+     * Create pipeline without texture (same descriptor heap flag applies)
     -*/
-    useTexture                                               = VK_FALSE;
+    useTexture = VK_FALSE;  // This works because we used the address of useTexture in specializationInfo, so changing the value here changes the specialization constant for the second pipeline (shaderStage)
+
     const VkGraphicsPipelineCreateInfo pipelineInfoNoTexture = {
         .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext               = &dynamicRenderingInfo,
+        .pNext               = &pipelineFlags2,  // Same flags2 chain as above
         .stageCount          = uint32_t(shaderStages.size()),
         .pStages             = shaderStages.data(),
         .pVertexInputState   = &vertexInputInfo,
@@ -3194,7 +3254,7 @@ private:
         .pDepthStencilState  = &depthStateInfo,
         .pColorBlendState    = &colorBlendingInfo,
         .pDynamicState       = &dynamicStateInfo,
-        .layout              = m_graphicPipelineLayout,
+        .layout              = VK_NULL_HANDLE,  // Required by VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT
     };
     VK_CHECK(vkCreateGraphicsPipelines(m_context.getDevice(), nullptr, 1, &pipelineInfoNoTexture, nullptr,
                                        &m_graphicsPipelineWithoutTexture));
@@ -3243,140 +3303,50 @@ private:
     ImGui::GetIO().ConfigFlags = ImGuiConfigFlags_DockingEnable | ImGuiConfigFlags_ViewportsEnable;
   }
 
+
   /*--
-   * The Descriptor Pool is used to allocate descriptor sets.
-   * There are two descriptor pools in this application:
-   * - One for the application texture descriptor sets (large arrays)
-   * - One for ImGui font textures and GBuffer textures for ImGui display
+   * Create descriptor heap buffers for bindless resource access (VK_EXT_descriptor_heap).
+   *
+   * Instead of traditional descriptor sets and pools, the descriptor heap stores sampler and
+   * image descriptors in GPU buffers. Shaders access them by index using layout(descriptor_heap).
+   *
+   * The heap is split into two parts:
+   *   1. Sampler heap  -- holds sampler descriptors (linear, nearest, etc.)
+   *   2. Resource heap  -- holds image descriptors (texture2D views)
+   *
+   * Each heap buffer has a "reserved range" at the end (required by the spec), followed by the
+   * user descriptors at the beginning. The host staging data is written with
+   * vkWriteSamplerDescriptorsEXT / vkWriteResourceDescriptorsEXT, then uploaded to GPU buffers.
+   *
+   * At draw time, vkCmdBindSamplerHeapEXT / vkCmdBindResourceHeapEXT bind these buffers.
   -*/
-  void createDescriptorPool()
+  void createDescriptorHeap(VkCommandBuffer cmd)
   {
-    VkPhysicalDeviceProperties2 deviceProperties2{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    vkGetPhysicalDeviceProperties2(m_context.getPhysicalDevice(), &deviceProperties2);
-    const auto& deviceProperties = deviceProperties2.properties;
+    // Query the descriptor heap properties: descriptor sizes, alignment, and maximum heap capacities
+    VkPhysicalDeviceDescriptorHeapPropertiesEXT heapProps{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 props2{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &heapProps};
+    vkGetPhysicalDeviceProperties2(m_context.getPhysicalDevice(), &props2);
 
-    // This is the descriptor pool for the application textures, which is used in shaders
-    {
-      m_maxTextures                 = std::min(m_maxTextures, deviceProperties.limits.maxDescriptorSetSampledImages);
-      VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, m_maxTextures};
-      uint32_t             maxDescriptorSets    = std::min(20U, deviceProperties.limits.maxDescriptorSetUniformBuffers);
-      const VkDescriptorPoolCreateInfo poolInfo = {
-          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-          .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT |  //  allows descriptor sets to be updated after they have been bound to a command buffer
-                   VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,  // individual descriptor sets can be freed from the descriptor pool
-          .maxSets = maxDescriptorSets,  // We only need one descriptor set for the textures, but it can be larger and adjusted to the number of sets
-          .poolSizeCount = 1,
-          .pPoolSizes    = &poolSize,
-      };
-      VK_CHECK(vkCreateDescriptorPool(m_context.getDevice(), &poolInfo, nullptr, &m_descriptorPool));
-      DBG_VK_NAME(m_descriptorPool);
-      LOGI("Created application descriptor pool: %u textures, %u sets", m_maxTextures, maxDescriptorSets);
-    }
+    // Compute how many descriptors the hardware can hold, accounting for the mandatory reserved range
+    uint32_t maxSamplerCapacity = static_cast<uint32_t>(
+        (heapProps.maxSamplerHeapSize - heapProps.minSamplerHeapReservedRange) / heapProps.samplerDescriptorSize);
+    uint32_t maxImageCapacity = static_cast<uint32_t>(
+        (heapProps.maxResourceHeapSize - heapProps.minResourceHeapReservedRange) / heapProps.imageDescriptorSize);
 
-    // This is the descriptor pool for the ImGui UI, which is used to display the textures and other resources (GBuffers).
-    {
-      // ImGui creates a descriptor set for each single texture. Therefore the pool size must be large enough to hold all textures of all sets.
-      uint32_t uiPoolSize        = std::min(20U, deviceProperties.limits.maxDescriptorSetSampledImages);
-      uint32_t maxDescriptorSets = std::min(uiPoolSize, deviceProperties.limits.maxDescriptorSetUniformBuffers);
-      VkDescriptorPoolSize       poolSize = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, uiPoolSize};
-      VkDescriptorPoolCreateInfo poolInfo = {
-          .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-          .flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-          .maxSets       = maxDescriptorSets,
-          .poolSizeCount = 1,
-          .pPoolSizes    = &poolSize,
-      };
+    // All heap buffers need these usage flags: device address for binding, transfer dst for upload,
+    // and the descriptor heap bit to mark them as heap storage
+    VkBufferUsageFlags2KHR heapUsage = VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT_KHR
+                                       | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR | VK_BUFFER_USAGE_2_DESCRIPTOR_HEAP_BIT_EXT;
 
-      VK_CHECK(vkCreateDescriptorPool(m_context.getDevice(), &poolInfo, nullptr, &m_uiDescriptorPool));
-      DBG_VK_NAME(m_uiDescriptorPool);
-      LOGI("Created UI descriptor pool: %u textures, %u sets", uiPoolSize, maxDescriptorSets);
-    }
-  }
+    // ---- Sampler Heap ----
+    // We only need one sampler in this sample (linear filtering), but the heap can hold more
+    uint32_t maxSamplers = std::min(1U, maxSamplerCapacity);
+    VkDeviceSize samplerHeapSize = heapProps.samplerDescriptorSize * maxSamplers + heapProps.minSamplerHeapReservedRange;
+    samplerHeapSize = utils::alignUp(samplerHeapSize, heapProps.samplerHeapAlignment);
+    std::vector<uint8_t> samplerHeapData(samplerHeapSize, 0);  // CPU staging buffer, zero-initialized
 
-  /*--
-   * The Vulkan descriptor set defines the resources that are used by the shaders.
-   * In this application we have two descriptor layout, one for the texture and one for the scene information.
-   * But only one descriptor set (texture), the scene information is a push descriptor.
-   * Set are used to group resources, and layout to define the resources.
-   * Push are limited to a certain number of bindings, but are synchronized with the frame.
-   * Set can be huge, but are not synchronized with the frame (command buffer).
-   -*/
-  void createGraphicDescriptorSet()
-  {
-    // First describe the layout of the texture descriptor, what and how many
-    {
-      static uint32_t numTextures = m_maxTextures;  // We don't need to set the exact number of texture the scene have.
-
-      // In comment, the layout for a storage buffer, which is not used in this sample, but rather a push descriptor (below)
-      const std::array<VkDescriptorSetLayoutBinding, 1> layoutBindings{{
-          {.binding         = shaderio::LBindTextures,
-           .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-           .descriptorCount = numTextures,
-           .stageFlags      = VK_SHADER_STAGE_ALL_GRAPHICS},
-          // This is if we would add another binding for the scene info, but instead we make another set, see below
-          // {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS},
-      }};
-
-      const VkDescriptorBindingFlags flags[] = {
-          // Flags for binding 0 (texture array):
-          VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |                // Can update while in use
-              VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT |  // Can update unused entries
-              VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT,  // Not all array elements need to be valid (0,2,3 vs 0,1,2,3)
-
-          // Flags for binding 1 (scene info buffer):
-          // VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT  // flags for storage buffer binding
-      };
-      const VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags{
-          .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
-          .bindingCount  = uint32_t(layoutBindings.size()),  // matches our number of bindings
-          .pBindingFlags = flags,                            // the flags for each binding
-      };
-
-      const VkDescriptorSetLayoutCreateInfo descriptorSetLayoutInfo{
-          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-          .pNext = &bindingFlags,
-          .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,  // Allows to update the descriptor set after it has been bound
-          .bindingCount = uint32_t(layoutBindings.size()),
-          .pBindings    = layoutBindings.data(),
-      };
-      VK_CHECK(vkCreateDescriptorSetLayout(m_context.getDevice(), &descriptorSetLayoutInfo, nullptr, &m_textureDescriptorSetLayout));
-      DBG_VK_NAME(m_textureDescriptorSetLayout);
-
-      // Allocate the descriptor set, needed only for larger descriptor sets
-      const VkDescriptorSetAllocateInfo allocInfo = {
-          .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-          .descriptorPool     = m_descriptorPool,
-          .descriptorSetCount = 1,
-          .pSetLayouts        = &m_textureDescriptorSetLayout,
-      };
-      VK_CHECK(vkAllocateDescriptorSets(m_context.getDevice(), &allocInfo, &m_textureDescriptorSet));
-      DBG_VK_NAME(m_textureDescriptorSet);
-    }
-
-    // Second this is another set which will be pushed
-    {
-      // This is the scene buffer information
-      const std::array<VkDescriptorSetLayoutBinding, 1> layoutBindings{
-          {{.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS}}};
-      const VkDescriptorSetLayoutCreateInfo descriptorSetLayoutInfo{
-          .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-          .flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT,
-          .bindingCount = uint32_t(layoutBindings.size()),
-          .pBindings    = layoutBindings.data(),
-      };
-      VK_CHECK(vkCreateDescriptorSetLayout(m_context.getDevice(), &descriptorSetLayoutInfo, nullptr, &m_graphicDescriptorSetLayout));
-      DBG_VK_NAME(m_graphicDescriptorSetLayout);
-    }
-  }
-
-  /*--
-   * The resources associated with the descriptor set must be set, in order to be used in the shaders.
-   * This is actually updating the unbind array of textures
-  -*/
-  void updateGraphicsDescriptorSet()
-  {
-    // The sampler used for the texture
-    const VkSampler sampler = m_samplerPool.acquireSampler({
+    // Write one sampler descriptor (linear filter, repeat addressing)
+    VkSamplerCreateInfo samplerCI{
         .sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .magFilter    = VK_FILTER_LINEAR,
         .minFilter    = VK_FILTER_LINEAR,
@@ -3385,51 +3355,110 @@ private:
         .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
         .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
         .maxLod       = VK_LOD_CLAMP_NONE,
-    });
-    DBG_VK_NAME(sampler);
+    };
+    // Using acquireSamplerDescriptor avoid any duplicate samplers in the heap.
+    uint32_t samplerIndex = m_samplerPool.acquireSamplerDescriptor(samplerCI);
 
-    // The image info
-    std::array<VkDescriptorImageInfo, 2> imageInfos{{
-        {.sampler = sampler, .imageView = m_image[0].view, .imageLayout = m_image[m_imageID].layout},
-        {.sampler = sampler, .imageView = m_image[1].view, .imageLayout = m_image[m_imageID].layout},
-    }};
+    // Point into the staging buffer at the correct offset for this sampler index
+    VkHostAddressRangeEXT samplerDst{
+        .address = samplerHeapData.data() + static_cast<size_t>(samplerIndex) * static_cast<size_t>(heapProps.samplerDescriptorSize),
+        .size = heapProps.samplerDescriptorSize,
+    };
+    // Write the sampler descriptor into host memory (CPU staging)
+    vkWriteSamplerDescriptorsEXT(m_context.getDevice(), 1, &samplerCI, &samplerDst);
 
-    std::array<VkWriteDescriptorSet, 1> writeDescriptorSets{{{
-        .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet          = m_textureDescriptorSet,  // Only needed if we are using a descriptor set, not push descriptor
-        .dstBinding      = shaderio::LBindTextures,  // layout(binding = 0) in the fragment shader
-        .dstArrayElement = 0,                        // If we were to use an array of images
-        .descriptorCount = uint32_t(imageInfos.size()),
-        .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .pImageInfo      = imageInfos.data(),
-    }}};
+    // Create the GPU buffer for the sampler heap and upload the staging data
+    m_samplerHeapBuffer =
+        m_allocator.createBufferAndUploadData(cmd, std::span(samplerHeapData), heapUsage, {}, heapProps.samplerHeapAlignment);
 
-    // This is if the scene info buffer if part of the descriptor set layout (we have it in a separate set/layout)
-    // VkDescriptorBufferInfo bufferInfo = {.buffer = m_sceneInfoBuffer.buffer, .offset = 0, .range = VK_WHOLE_SIZE};
-    // writeDescriptorSets.push_back({
-    //     .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-    //     .dstSet          = m_textureDescriptorSet,  // Not set, this is a push descriptor
-    //     .dstBinding      = 1,                       // layout(binding = 1) in the fragment shader
-    //     .dstArrayElement = 0,                       // If we were to use an array of images
-    //     .descriptorCount = 1,
-    //     .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-    //     .pBufferInfo     = &bufferInfo,
-    // });
+    // ---- Resource (Image) Heap ----
+    // The resource heap holds image descriptors. We allocate enough slots for all application textures.
+    uint32_t maxResources = std::min(m_maxTextures, maxImageCapacity);
+    VkDeviceSize resourceHeapSize = heapProps.imageDescriptorSize * maxResources + heapProps.minResourceHeapReservedRange;
+    resourceHeapSize = utils::alignUp(resourceHeapSize, heapProps.resourceHeapAlignment);
+    std::vector<uint8_t> resourceHeapData(resourceHeapSize, 0);  // CPU staging buffer, zero-initialized
 
-    /*-- 
-     * With the flags set it ACTUALLY allows:
-     *  - You can update after binding to a command buffer but before submitting.
-     *  - You can update while the descriptor set is bound in another thread.
-     *  - You don't invalidate the command buffer when you update.
-     *  - Multiple threads can update different descriptors at the same time
-     * What it does NOT allow:
-     *  - Update while the GPU is actively reading it in a shader
-     *  - Skipping proper synchronization between CPU updates and GPU reads
-     *  - Simultaneous updates to the same descriptor
-     * Since this is called before starting to render, we don't need to worry about the first two.
-    -*/
-    vkUpdateDescriptorSets(m_context.getDevice(), uint32_t(writeDescriptorSets.size()), writeDescriptorSets.data(), 0, nullptr);
+    // Build arrays of descriptor info for all images, then write them in a single batched call.
+    // Each struct chain must stay alive until the write: ResourceDescriptorInfo -> ImageDescriptorInfo -> ImageViewCreateInfo.
+    constexpr uint32_t                                  imageCount = 2;
+    std::array<VkImageViewCreateInfo, imageCount>       viewInfos{};
+    std::array<VkImageDescriptorInfoEXT, imageCount>    imageDescInfos{};
+    std::array<VkResourceDescriptorInfoEXT, imageCount> resInfos{};
+    std::array<VkHostAddressRangeEXT, imageCount>       resDsts{};
+
+    for(uint32_t i = 0; i < imageCount; i++)
+    {
+      viewInfos[i] = {
+          .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+          .image            = m_image[i].image,
+          .viewType         = VK_IMAGE_VIEW_TYPE_2D,
+          .format           = m_image[i].format,
+          .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+      };
+
+      imageDescInfos[i] = {
+          .sType  = VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT,
+          .pView  = &viewInfos[i],
+          .layout = m_image[i].layout,
+      };
+
+      resInfos[i] = {
+          .sType = VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT,
+          .type  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+          .data  = {.pImage = &imageDescInfos[i]},
+      };
+
+      resDsts[i] = {
+          .address = resourceHeapData.data() + static_cast<size_t>(i) * static_cast<size_t>(heapProps.imageDescriptorSize),
+          .size = heapProps.imageDescriptorSize,
+      };
+    }
+
+    // Single batched write — more efficient than one call per image, especially at scale.
+    vkWriteResourceDescriptorsEXT(m_context.getDevice(), imageCount, resInfos.data(), resDsts.data());
+
+    // Create the GPU buffer for the resource heap and upload the staging data
+    m_resourceHeapBuffer = m_allocator.createBufferAndUploadData(cmd, std::span(resourceHeapData), heapUsage, {},
+                                                                 heapProps.resourceHeapAlignment);
+
+    // Store heap metadata needed later for vkCmdBindSamplerHeapEXT / vkCmdBindResourceHeapEXT.
+    // The bind info describes: total heap size, where the reserved range starts, and its size.
+    m_samplerHeapSize        = samplerHeapSize;
+    m_resourceHeapSize       = resourceHeapSize;
+    m_samplerReservedOffset  = heapProps.samplerDescriptorSize * maxSamplers;
+    m_samplerReservedSize    = heapProps.minSamplerHeapReservedRange;
+    m_resourceReservedOffset = heapProps.imageDescriptorSize * maxResources;
+    m_resourceReservedSize   = heapProps.minResourceHeapReservedRange;
   }
+
+  /*--
+   * Create a descriptor pool for ImGui.
+   * ImGui still uses traditional descriptor sets for its font textures and GBuffer display textures.
+   * The application's own textures/samplers use the descriptor heap instead (see createDescriptorHeap).
+  -*/
+  void createUIDescriptorPool()
+  {
+    VkPhysicalDeviceProperties2 deviceProperties2{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    vkGetPhysicalDeviceProperties2(m_context.getPhysicalDevice(), &deviceProperties2);
+    const auto& deviceProperties = deviceProperties2.properties;
+
+    // ImGui creates a descriptor set for each single texture. Therefore the pool size must be large enough to hold all textures of all sets.
+    uint32_t uiPoolSize                 = std::min(20U, deviceProperties.limits.maxDescriptorSetSampledImages);
+    uint32_t maxDescriptorSets          = std::min(uiPoolSize, deviceProperties.limits.maxDescriptorSetUniformBuffers);
+    VkDescriptorPoolSize       poolSize = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, uiPoolSize};
+    VkDescriptorPoolCreateInfo poolInfo = {
+        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        .maxSets       = maxDescriptorSets,
+        .poolSizeCount = 1,
+        .pPoolSizes    = &poolSize,
+    };
+
+    VK_CHECK(vkCreateDescriptorPool(m_context.getDevice(), &poolInfo, nullptr, &m_uiDescriptorPool));
+    DBG_VK_NAME(m_uiDescriptorPool);
+    LOGI("Created UI descriptor pool: %u textures, %u sets", uiPoolSize, maxDescriptorSets);
+  }
+
 
   /*--
    * Loading an image using the stb_image library.
@@ -3461,17 +3490,7 @@ private:
     utils::ImageResource image = m_allocator.createImageAndUploadData(cmd, dataSpan, imageInfo, VK_IMAGE_LAYOUT_GENERAL);
     DBG_VK_NAME(image.image);
     image.extent = {uint32_t(w), uint32_t(h)};
-
-    // Create the image view
-    const VkImageViewCreateInfo viewInfo = {
-        .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image            = image.image,
-        .viewType         = VK_IMAGE_VIEW_TYPE_2D,
-        .format           = format,
-        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1},
-    };
-    VK_CHECK(vkCreateImageView(m_context.getDevice(), &viewInfo, nullptr, &image.view));
-    DBG_VK_NAME(image.view);
+    image.format = format;
 
     return image;
   }
@@ -3538,7 +3557,7 @@ private:
   utils::Swapchain         m_swapchain;        // The swapchain
   utils::Buffer            m_vertexBuffer;     // The vertex buffer (two triangles) (SSBO)
   utils::Buffer            m_pointsBuffer;     // The data buffer (SSBO)
-  utils::Buffer            m_sceneInfoBuffer;  // The buffer used to pass data to the shader (UBO)
+  utils::Buffer            m_sceneInfoBuffer;  // Scene info GPU buffer, updated once per frame, accessed via BDA
   utils::ImageResource     m_image[2];         // The loaded image
   utils::SamplerPool       m_samplerPool;      // The sampler pool, used to create a sampler for the texture
 
@@ -3548,17 +3567,26 @@ private:
   VkExtent2D   m_windowSize{800, 600};    // The window size
   VkExtent2D   m_viewportSize{800, 600};  // The viewport area in the window
 
-  VkPipelineLayout      m_graphicPipelineLayout{};           // The pipeline layout use with graphics pipeline
-  VkPipelineLayout      m_computePipelineLayout{};           // The pipeline layout use with compute pipeline
-  VkPipeline            m_computePipeline{};                 // The compute pipeline
-  VkPipeline            m_graphicsPipelineWithTexture{};     // The graphics pipeline with texture
-  VkPipeline            m_graphicsPipelineWithoutTexture{};  // The graphics pipeline without texture
-  VkCommandPool         m_transientCmdPool{};                // The command pool
-  VkDescriptorPool      m_descriptorPool{};                  // Texture/shader descriptor pool
-  VkDescriptorPool      m_uiDescriptorPool{};                // Ui descriptor pool
-  VkDescriptorSetLayout m_textureDescriptorSetLayout{};      // Descriptor set layout for all textures (set 0)
-  VkDescriptorSetLayout m_graphicDescriptorSetLayout{};      // Descriptor set layout for the scene info (set 1)
-  VkDescriptorSet       m_textureDescriptorSet{};            // Application descriptor set (storing all textures)
+  // No graphics pipeline layout (VK_NULL_HANDLE with descriptor heap + push data)
+  VkPipelineLayout m_computePipelineLayout{};           // The pipeline layout use with compute pipeline
+  VkPipeline       m_computePipeline{};                 // The compute pipeline
+  VkPipeline       m_graphicsPipelineWithTexture{};     // The graphics pipeline with texture
+  VkPipeline       m_graphicsPipelineWithoutTexture{};  // The graphics pipeline without texture
+  VkCommandPool    m_transientCmdPool{};                // The command pool
+  VkDescriptorPool m_uiDescriptorPool{};  // ImGui descriptor pool (ImGui still uses traditional descriptor sets)
+
+  // Descriptor heap (VK_EXT_descriptor_heap): replaces traditional descriptor sets for textures/samplers.
+  // GPU buffers holding sampler and image descriptors, bound per-frame via vkCmdBind*HeapEXT.
+  utils::Buffer m_samplerHeapBuffer{};   // GPU buffer holding sampler descriptors
+  utils::Buffer m_resourceHeapBuffer{};  // GPU buffer holding image (resource) descriptors
+  // Heap metadata needed for VkBindHeapInfoEXT at draw time
+  VkDeviceSize m_samplerHeapSize{};         // Total aligned size of the sampler heap buffer
+  VkDeviceSize m_resourceHeapSize{};        // Total aligned size of the resource heap buffer
+  VkDeviceSize m_samplerReservedOffset{};   // Byte offset where the sampler reserved range starts
+  VkDeviceSize m_samplerReservedSize{};     // Size of the mandatory sampler reserved range
+  VkDeviceSize m_resourceReservedOffset{};  // Byte offset where the resource reserved range starts
+  VkDeviceSize m_resourceReservedSize{};    // Size of the mandatory resource reserved range
+
 
   // Frame resources and synchronization
   struct FrameData

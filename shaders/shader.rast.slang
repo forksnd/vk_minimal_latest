@@ -42,20 +42,15 @@ struct PixelOutput
 // Resource Bindings
 //------------------------------------------------------------------------------
 
-// Bind an array of textures
-// Note: [[vk::binding(x,y)]] specifies binding=x in descriptor set=y for Vulkan
-[[vk::binding(LBindTextures, LSetTextures)]]
-Sampler2D inTexture[]; // Array of textures in descriptor set 0, binding 0
-
-// Bind our scene information constant buffer
-// Note: ConstantBuffer is similar to Vulkan's UBO (Uniform Buffer Object)
-[[vk::binding(LBindSceneInfo, LSetScene)]]
-ConstantBuffer<SceneInfo> sceneInfo; // Scene data in descriptor set 0, binding 1
-
-// Bind push constants for frequently updated data
-// Note: Push constants are fastest way to send small amount of data to shader
+// Push data (vkCmdPushDataEXT): carries only the scene buffer address and per-draw color.
+// With descriptor heap (VK_EXT_descriptor_heap), the pipeline layout is VK_NULL_HANDLE,
+// so traditional push constants and push descriptors (UBOs) cannot be used.
 [[vk::push_constant]]
-ConstantBuffer<PushConstant> pushConst;
+ConstantBuffer<GraphicsPushData> pushData;
+
+// Descriptor heap: textures and samplers live in GPU heap buffers (VK_EXT_descriptor_heap).
+// We access them by heap index using Texture2D.Handle(uint2(index, 0)) and
+// SamplerState.Handle(uint2(index, 0)). This replaces the old [[vk::binding(...)]] Sampler2D array.
 
 // Specialization constant - can be set at pipeline creation time
 // Note: This is equivalent to GLSL's layout(constant_id = X)
@@ -70,11 +65,15 @@ const bool useTexture = false; // Controls whether texture sampling is enabled
 [shader("vertex")]
 VertexOutput vertexMain(VertexInput input)
 {
+    // Access the scene info buffer via buffer device address (updated once per frame)
+    // Cast the uint64 address to a typed pointer -- Slang compiles this to SPIR-V untyped pointer access
+    SceneInfo* scene = (SceneInfo*)pushData.sceneInfoAddress;
+
     // Start with the input position
     vec3 pos = input.position;
 
     // Correct for screen aspect ratio to prevent stretching
-    float aspectRatio = sceneInfo.resolution.y / sceneInfo.resolution.x;
+    float aspectRatio = scene.resolution.y / scene.resolution.x;
     pos.x *= aspectRatio;
 
     VertexOutput output;
@@ -95,16 +94,18 @@ PixelOutput fragmentMain(VertexOutput input)
 {
     PixelOutput output;
 
-    // Convert fragment position to normalized device coordinates (-1 to 1 range)
-    float2 fragPos = (input.position.xy / sceneInfo.resolution) * 2.0 - 1.0;
+    // Access the scene info buffer via buffer device address (same buffer, updated once per frame)
+    SceneInfo* scene = (SceneInfo*)pushData.sceneInfoAddress;
 
-    // Access the data buffer using Vulkan's buffer device address feature
-    // Note: This is a more direct way to access buffer data than traditional descriptors
-    vec2* datas = (vec2*)sceneInfo.dataBufferAddress;
+    // Convert fragment position to normalized device coordinates (-1 to 1 range)
+    float2 fragPos = (input.position.xy / scene.resolution) * 2.0 - 1.0;
+
+    // Access the data buffer using buffer device address (stored in SceneInfo)
+    vec2* datas = (vec2*)scene.dataBufferAddress;
 
     // Find the minimum distance to any point in our data buffer
     float minDist = 1e10; // Initialize to a large value
-    for (int i = 0; i < sceneInfo.numData; i++)
+    for (int i = 0; i < scene.numData; i++)
     {
         vec2  pnt  = datas[i];
         float dist = distance(fragPos, pnt);
@@ -118,15 +119,20 @@ PixelOutput fragmentMain(VertexOutput input)
     float alpha = 1.0 - smoothstep(radius, radius - edgeSmooth, minDist);
 
     // Calculate colors for blending
-    // Point color animated using push constant data
-    float4 pointColor = float4(sceneInfo.animValue * pushConst.color, 1.0);
+    // Point color animated using scene data + per-draw color from push data
+    float4 pointColor = float4(scene.animValue * pushData.color, 1.0);
     // Triangle color from interpolated vertex color
     float4 triangleColor = float4(input.color, 1.0);
 
-    // Conditionally sample texture based on specialization constant
+    // Conditionally sample texture using descriptor heap handles.
+    // Texture2D.Handle(uint2(index, 0)) creates a handle from the resource heap at the given index.
+    // SamplerState.Handle(uint2(0, 0)) gets the linear sampler at index 0 in the sampler heap.
+    // This is the Slang equivalent of GLSL's layout(descriptor_heap) access.
     if (useTexture)
     {
-        triangleColor *= inTexture[sceneInfo.texId].Sample(input.uv);
+        Texture2D    tex  = Texture2D.Handle(uint2(scene.texId, 0));
+        SamplerState samp = SamplerState.Handle(uint2(0, 0));
+        triangleColor *= tex.Sample(samp, input.uv);
     }
 
     // Blend between point and triangle color based on distance field

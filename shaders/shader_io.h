@@ -11,36 +11,35 @@ typealias vec4 = float4;
 #define STATIC_CONST const
 #endif
 
-// Layout constants
-// Set 0
-STATIC_CONST int LSetTextures  = 0;
-STATIC_CONST int LBindTextures = 0;
-// Set 1
-STATIC_CONST int LSetScene      = 1;
-STATIC_CONST int LBindSceneInfo = 0;
 // Vertex layout
 STATIC_CONST int LVPosition = 0;
 STATIC_CONST int LVColor    = 1;
 STATIC_CONST int LVTexCoord = 2;
 
-
+// Scene information, stored in a GPU buffer and updated once per frame via vkCmdUpdateBuffer.
+// The shader accesses it through a buffer device address (buffer reference), not a descriptor set.
 struct SceneInfo
 {
-  uint64_t dataBufferAddress;
-  vec2     resolution;
-  float    animValue;
-  int      numData;
-  int      texId;
+  uint64_t dataBufferAddress;  // Buffer device address of the points data buffer
+  vec2     resolution;         // Viewport resolution
+  float    animValue;          // Animation value (sine wave)
+  int      numData;            // Number of points in the data buffer
+  int      texId;              // Which texture to sample from the descriptor heap
 };
 
-struct PushConstant
+// Push data for the graphics pipeline (vkCmdPushDataEXT).
+// With descriptor heap, the pipeline layout is VK_NULL_HANDLE, so traditional push constants
+// and push descriptors cannot be used. Push data carries only the minimum needed per draw call:
+// the address of the scene buffer (updated once per frame) and the per-draw color.
+struct GraphicsPushData
 {
-  vec3 color;
+  uint64_t sceneInfoAddress;  // Buffer device address of the SceneInfo GPU buffer
+  vec3     color;             // Per-draw triangle color (changes between draw calls)
 };
 
 struct PushConstantCompute
 {
-  uint64_t bufferAddress;
+  uint64_t bufferAddress;  // Buffer device address of the vertex buffer
   float    rotationAngle;
   int      numVertex;
 };
