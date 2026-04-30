@@ -13,97 +13,57 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ *
  * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 /*------------------------------------------------------------------
 
-# Modern Vulkan Sample Application
+# minimal_latest.cpp
 
-This sample demonstrates how to create a modern Vulkan application using Vulkan 1.4 
-features and best practices in a single, self-contained file. It is quite long but 
-covers what is needed to create a Vulkan application that is efficient, modern, and
-can be used as a starting point for more complex applications.
-
-The code shows how to:
-
-## Core Features
-- Setup a modern Vulkan context with proper validation and debugging
-- Implement dynamic rendering (no render passes needed)
-- Use push descriptors for efficient resource binding
-- Demonstrate graphics and compute shader interop
-- Use buffer device address for GPU-visible pointers
-- Implement proper resource management using VMA (Vulkan Memory Allocator)
+This is the sample application. The reusable Vulkan helpers it builds on live
+in `vk_framework.h`; start there if you're new.
 
 ## What You'll See
 The sample renders two intersecting triangles:
 - One triangle is colored and dynamically animated by a compute shader
 - The other triangle is textured using an image loaded from disk
-- Distance field rendered points that flash based on time
-- ImGui overlay showing frame rate
+- Distance-field rendered points that flash based on time
+- ImGui overlay showing frame rate, plus a Settings panel
 
-## Technical Highlights
-- Double/Triple buffering with proper synchronization
-- Modern descriptor management with push descriptors
-- Specialization constants to create pipeline variants
-- Basic texture loading and sampling
-- Proper cleanup and resource management
-- Debug utilities for object naming and validation
-- Timeline semaphores for efficient synchronization
-
-## Key Classes
-- Context: Vulkan instance, device setup
-- Swapchain: Presentation and frame management  
-- ResourceAllocator: Memory allocation via VMA
-- SamplerPool: Texture sampler management
-- GBuffer: Multi render target management
-
-## Key Operations Flow
-
-### Initialization (init())
-1. Creates Vulkan context (instance, device, queues)
-2. Sets up the swapchain for rendering
-3. Creates command pools and descriptor pools
-4. Sets up graphics pipeline:
-   - Loads shaders (vertex, fragment, compute)
-   - Creates pipeline layouts and descriptor sets
-   - Sets up vertex buffers and textures
-5. Initializes ImGui for UI rendering
-
-
-### Main Rendering Loop (drawFrame())
-1. Acquires next swapchain image
-2. Updates vertex positions using compute shader
-3. Records render commands:
-   - Updates scene uniforms
-   - Draws colored triangle (transformed by compute)
-   - Draws textured triangle
-   - Renders UI overlay
-4. Submits commands and presents frame
+## Main Rendering Loop (drawFrame())
+1. Wait on the slot's timeline value, then acquire the next swapchain image
+2. Update vertex positions via the compute shader (vkCmdPushConstants2 + BDA)
+3. Record render commands:
+   - Update the scene info buffer (vkCmdUpdateBuffer to a BDA-addressed buffer)
+   - Bind sampler / resource descriptor heaps
+   - Set every dynamic state required by shader objects once per frame
+   - Bind (vertex, fragment) shader objects via vkCmdBindShadersEXT
+   - Draw colored triangle, swap fragment shader, draw textured triangle
+   - Render the offscreen RenderTarget into the swapchain image via ImGui
+4. Submit and present (signals presentSemaphore[image], advances slot)
 
 See detailed documentation above each function for implementation details.
 
 
-There is a lot of comments, and to remove the all documentation, replace using
-this regular expression:
+There are a lot of comments; to strip all the block documentation, replace
+using this regular expression:
 - Visual Studio: /\*--([\r\n]|.)*?-\*\/
 - Others       : /\*--[\s\S]*?-\*\/
 
 ------------------------------------------------------------------*/
 
 
-/*--
- * We are using Volk that provides a simple way to load Vulkan functions.
- * This is also loading all extensions and functions up to Vulkan 1.3.
- * That way we don't link statically to the Vulkan library.
--*/
+//--- VMA implementation bootstrap ----------------------------------------------
+// The Vulkan Memory Allocator header is "single-TU": exactly one .cpp must
+// define VMA_IMPLEMENTATION before including vk_mem_alloc.h. This is that .cpp;
+// every other piece of code in this project reaches VMA through vk_framework.h,
+// which brings in the header (types only) wherever it is included.
+//
+// Volk must precede VMA so vk_mem_alloc.h sees the Vulkan types.
 #include "volk.h"
 
-/*--
- * We are using the Vulkan Memory Allocator (VMA) to manage memory.
- * This is a library that helps to allocate memory for Vulkan resources.
--*/
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #define VMA_IMPLEMENTATION
 #define VMA_LEAK_LOG_FORMAT(format, ...)                                                                               \
@@ -111,7 +71,6 @@ this regular expression:
     printf((format), __VA_ARGS__);                                                                                     \
     printf("\n");                                                                                                      \
   }
-// Disable warnings in VMA
 #ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
@@ -131,68 +90,32 @@ this regular expression:
 #pragma clang diagnostic pop
 #endif
 
+//--- Framework -----------------------------------------------------------------
+// Brings in volk again (include-guarded, no-op), VMA types, GLFW, ImGui,
+// logger.h, debug_util.h, STL; ASSERT / VK_CHECK macros; and the utils::
+// namespace (Buffer/Image structs, barrier + layout helpers, Context,
+// Swapchain, FramePacer, ResourceAllocator, SamplerPool, RenderTarget, findFile).
+#include "vk_framework.h"
 
-// Return string for the Vulkan enum, like error messages
-#include "vulkan/vk_enum_string_helper.h"
-
-/*--
- * GLFW is a library that provides a simple way to create windows and handle input.
--*/
-#ifdef _WIN32
-#define GLFW_EXPOSE_NATIVE_WIN32
-#elif defined(__linux__)
-#include <signal.h>  // For SIGINT
-#endif
-#include <GLFW/glfw3.h>
-
-/*--
- * GLM is a header-only library for mathematics.
- * It provides a simple way to handle vectors, matrices, and other mathematical objects.
- * We are using it to handle the vertex data and the transformation matrices.
--*/
-#include <glm/glm.hpp>
-
-// Logger
-#include "logger.h"
-
-// Debug utilities for naming Vulkan objects (DBG_VK_NAME)
-#include "debug_util.h"
-
-// Some graphic user interface (GUI) using Dear ImGui
-#include "backends/imgui_impl_glfw.h"
-#include "backends/imgui_impl_vulkan.h"
-#include "imgui.h"
-#include "imgui_internal.h"  // For Docking
-
-// To load JPG/PNG images
+//--- stb_image implementation (single-TU requirement) --------------------------
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
-// The frame pacer uses Windows APIs if available to get more precise timing.
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#undef APIENTRY  // GLFW defines this but Windows tries to redefine it
-#include <Windows.h>
-#include <timeapi.h>
+/*--
+ * The shaders are compiled to SPIR-V and embedded in the C++ code by CMake.
+ * Both Slang and GLSL variants are always compiled; the switch below only
+ * decides which SPIR-V blobs the C++ includes and binds.
+ *
+ * Slang is the canonical shader path for this sample. Flip USE_SLANG to 0 to
+ * build against the GLSL equivalents instead -- useful for comparing the two
+ * languages compiling down to the same Vulkan behaviour, and for CI coverage.
+ * CMake (-DUSE_SLANG=OFF) can override this default without editing the file.
+-*/
+#ifndef USE_SLANG
+#define USE_SLANG 1
 #endif
 
-// Standard C++ includes
-#include <array>
-#include <chrono>         // For std::chrono::high_resolution_clock, std::chrono::duration
-#include <cmath>          // For std::sin, ... functions
-#include <filesystem>     // For std::filesystem::path ...
-#include <iostream>       // For std::cerr
-#include <limits>         // for std::numeric_limits<double>::infinity()
-#include <span>           // For std::span
-#include <thread>         // For std::this_thread::sleep_for
-#include <unordered_map>  // For std::unordered_map
-#include <vector>         // For std::vector
-
-/*--
- * The shaders are compiled to Spir-V and embedded in the C++ code. (CMAKE)
--*/
-
-#ifdef USE_SLANG
+#if USE_SLANG
 #include "_autogen/shader.comp.slang.h"
 #include "_autogen/shader.rast.slang.h"
 #else
@@ -201,24 +124,10 @@ this regular expression:
 #include "_autogen/shader.comp.glsl.h"
 #endif
 
-namespace shaderio {  // Shader IO namespace - use to share code between device and host
-using namespace glm;  // Allow to use GLSL type, without glm:: prefix and without leaking in global namespace
+namespace shaderio {  // Shader IO namespace -- shared layout between C++ and shaders
+using namespace glm;  // GLSL-style types without the glm:: prefix inside the namespace
 #include "shaders/shader_io.h"
 }  // namespace shaderio
-
-// Macro to either assert or throw based on the build type
-#ifdef NDEBUG
-#define ASSERT(condition, message)                                                                                     \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    if(!(condition))                                                                                                   \
-    {                                                                                                                  \
-      throw std::runtime_error(message);                                                                               \
-    }                                                                                                                  \
-  } while(false)
-#else
-#define ASSERT(condition, message) assert((condition) && (message))
-#endif
 
 
 //--- Geometry -------------------------------------------------------------------------------------------------------------
@@ -230,12 +139,15 @@ using namespace glm;  // Allow to use GLSL type, without glm:: prefix and withou
 struct Vertex : public shaderio::Vertex
 {
   /*--
-   * The binding description is used to describe at which rate to load data from memory throughout the vertices.
+   * The binding description tells the pipeline at which rate to load data from
+   * memory throughout the vertices. Returned by const-reference to a static
+   * constexpr array so we don't reconstruct it on every call.
   -*/
-  static auto getBindingDescription()
+  static const auto& getBindingDescription()
   {
-    return std::to_array<VkVertexInputBindingDescription>(
+    static constexpr auto kBindings = std::to_array<VkVertexInputBindingDescription>(
         {{.binding = 0, .stride = sizeof(Vertex), .inputRate = VK_VERTEX_INPUT_RATE_VERTEX}});
+    return kBindings;
   }
 
   /*--
@@ -243,12 +155,13 @@ struct Vertex : public shaderio::Vertex
    * a chunk of vertex data originating from a binding description.
    * See in the vertex shader how the location is used to access the data.
   -*/
-  static auto getAttributeDescriptions()
+  static const auto& getAttributeDescriptions()
   {
-    return std::to_array<VkVertexInputAttributeDescription>(
+    static constexpr auto kAttributes = std::to_array<VkVertexInputAttributeDescription>(
         {{.location = shaderio::LVPosition, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = uint32_t(offsetof(Vertex, position))},
          {.location = shaderio::LVColor, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = uint32_t(offsetof(Vertex, color))},
          {.location = shaderio::LVTexCoord, .format = VK_FORMAT_R32G32_SFLOAT, .offset = uint32_t(offsetof(Vertex, texCoord))}});
+    return kAttributes;
   }
 };
 
@@ -268,1983 +181,6 @@ static const auto s_vertices = std::to_array<shaderio::Vertex>({
 static const auto s_points = std::to_array<glm::vec2>({{0.05F, 0.0F}, {-0.05F, 0.0F}, {0.0F, -0.05F}, {0.0F, 0.05F}});
 
 
-//--- Vulkan Helpers ------------------------------------------------------------------------------------------------------------
-#ifdef NDEBUG
-#define VK_CHECK(vkFnc) vkFnc
-#else
-#define VK_CHECK(vkFnc)                                                                                                \
-  {                                                                                                                    \
-    if(const VkResult checkResult = (vkFnc); checkResult != VK_SUCCESS)                                                \
-    {                                                                                                                  \
-      const char* errMsg = string_VkResult(checkResult);                                                               \
-      LOGE("Vulkan error: %s", errMsg);                                                                                \
-      ASSERT(checkResult == VK_SUCCESS, errMsg);                                                                       \
-    }                                                                                                                  \
-  }
-#endif
-
-namespace utils {
-
-/*--
- * A buffer is a region of memory used to store data.
- * It is used to store vertex data, index data, uniform data, and other types of data.
- * There is a VkBuffer object that represents the buffer, and a VmaAllocation object that represents the memory allocation.
- * The address is used to access the buffer in the shader.
--*/
-struct Buffer
-{
-  VkBuffer        buffer{};      // Vulkan Buffer
-  VmaAllocation   allocation{};  // Memory associated with the buffer
-  VkDeviceAddress address{};     // Address of the buffer in the shader
-};
-
-/*--
- * An image is a region of memory used to store image data.
- * It is used to store texture data, framebuffer data, and other types of data.
--*/
-struct Image
-{
-  VkImage       image{};       // Vulkan Image
-  VmaAllocation allocation{};  // Memory associated with the image
-};
-
-/*-- 
- * The image resource is an image with an image view and a layout.
- * and other information like format and extent.
--*/
-struct ImageResource : Image
-{
-  VkExtent2D    extent{};  // Size of the image
-  VkFormat      format{};  // Format of the image (e.g. VK_FORMAT_R8G8B8A8_UNORM)
-  VkImageLayout layout{};  // Layout of the image (color attachment, shader read, ...)
-};
-
-/*- Not implemented here -*/
-struct AccelerationStructure
-{
-  VkAccelerationStructureKHR accel{};
-  VmaAllocation              allocation{};
-  VkDeviceAddress            deviceAddress{};
-  VkDeviceSize               size{};
-  Buffer                     buffer;  // Underlying buffer
-};
-
-/*--
- * A queue is a sequence of commands that are executed in order.
- * The queue is used to submit command buffers to the GPU.
- * The family index is used to identify the queue family (graphic, compute, transfer, ...) .
- * The queue index is used to identify the queue in the family, multiple queues can be in the same family.
--*/
-struct QueueInfo
-{
-  uint32_t familyIndex = ~0U;  // Family index of the queue (graphic, compute, transfer, ...)
-  uint32_t queueIndex  = ~0U;  // Index of the queue in the family
-  VkQueue  queue{};            // The queue object
-};
-
-/*--
- * Aligns a value up to the next multiple of the alignment.
- * If the alignment is 0, it returns the original value.
- */
-VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment)
-{
-  if(alignment == 0)
-  {
-    return value;
-  }
-  return ((value + alignment - 1) / alignment) * alignment;
-}
-
-/*-- 
- * Combines hash values using the FNV-1a based algorithm 
--*/
-static std::size_t hashCombine(std::size_t seed, auto const& value)
-{
-  return seed ^ (std::hash<std::decay_t<decltype(value)>>{}(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
-}
-
-/*--
- * Initialize a newly created image to GENERAL layout (used for color/depth buffers)
--*/
-static void cmdInitImageLayout(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspectMask = VK_IMAGE_ASPECT_COLOR_BIT)
-{
-  const VkImageMemoryBarrier2 barrier{
-      .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-      .srcStageMask  = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-      .srcAccessMask = VK_ACCESS_2_NONE,
-      .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-      .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-      .oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED,
-      .newLayout     = VK_IMAGE_LAYOUT_GENERAL,
-      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image               = image,
-      .subresourceRange    = {aspectMask, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
-
-  const VkDependencyInfo depInfo{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier};
-
-  vkCmdPipelineBarrier2(cmd, &depInfo);
-}
-
-/*--
- * Transition swapchain image layout for the presentation/rendering cycle:
- * - UNDEFINED -> PRESENT_SRC_KHR (swapchain initialization)
- * - PRESENT_SRC_KHR <-> GENERAL (rendering cycle)
--*/
-static void cmdTransitionSwapchainLayout(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout)
-{
-  VkPipelineStageFlags2 srcStage = 0, dstStage = 0;
-  VkAccessFlags2        srcAccess = 0, dstAccess = 0;
-
-  if(oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
-  {
-    // Swapchain initialization
-    srcStage  = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-    srcAccess = VK_ACCESS_2_NONE;
-    dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dstAccess = VK_ACCESS_2_NONE;
-  }
-  else if(oldLayout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR && newLayout == VK_IMAGE_LAYOUT_GENERAL)
-  {
-    // Before rendering
-    srcStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    srcAccess = VK_ACCESS_2_NONE;
-    dstStage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-  }
-  else if(oldLayout == VK_IMAGE_LAYOUT_GENERAL && newLayout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
-  {
-    // After rendering
-    srcStage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    srcAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-    dstStage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dstAccess = VK_ACCESS_2_NONE;
-  }
-  else
-  {
-    ASSERT(false, "Unsupported swapchain layout transition!");
-    srcStage = dstStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    srcAccess = dstAccess = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-  }
-
-  const VkImageMemoryBarrier2 barrier{.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                                      .srcStageMask        = srcStage,
-                                      .srcAccessMask       = srcAccess,
-                                      .dstStageMask        = dstStage,
-                                      .dstAccessMask       = dstAccess,
-                                      .oldLayout           = oldLayout,
-                                      .newLayout           = newLayout,
-                                      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                      .image               = image,
-                                      .subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-
-  const VkDependencyInfo depInfo{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier};
-
-  vkCmdPipelineBarrier2(cmd, &depInfo);
-}
-
-/*-- 
- *  This helper returns the access mask for a given stage mask.
--*/
-static VkAccessFlags2 inferAccessMaskFromStage(VkPipelineStageFlags2 stage, bool src)
-{
-  VkAccessFlags2 access = 0;
-
-  // Shader stages: default to READ|WRITE for src (to flush writes), READ for dst (to consume)
-  const bool hasCompute  = (stage & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) != 0;
-  const bool hasFragment = (stage & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) != 0;
-  const bool hasVertex   = (stage & VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT) != 0;
-  if(hasCompute || hasFragment || hasVertex)
-  {
-    access |= src ? (VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT) : VK_ACCESS_2_SHADER_READ_BIT;
-  }
-
-  if((stage & VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT) != 0)
-    access |= VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;  // Always read-only
-  if((stage & VK_PIPELINE_STAGE_2_TRANSFER_BIT) != 0)
-    access |= src ? VK_ACCESS_2_TRANSFER_READ_BIT : VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  ASSERT(access != 0, "Missing stage implementation");
-  return access;
-}
-
-/*--
- * This useful function simplifies the addition of buffer barriers, by inferring 
- * the access masks from the stage masks, and adding the buffer barrier to the command buffer.
--*/
-static void cmdBufferMemoryBarrier(VkCommandBuffer       commandBuffer,
-                                   VkBuffer              buffer,
-                                   VkPipelineStageFlags2 srcStageMask,
-                                   VkPipelineStageFlags2 dstStageMask,
-                                   VkAccessFlags2        srcAccessMask       = 0,  // Default to infer if not provided
-                                   VkAccessFlags2        dstAccessMask       = 0,  // Default to infer if not provided
-                                   VkDeviceSize          offset              = 0,
-                                   VkDeviceSize          size                = VK_WHOLE_SIZE,
-                                   uint32_t              srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                   uint32_t              dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED)
-{
-  // Infer access masks if not explicitly provided
-  if(srcAccessMask == 0)
-  {
-    srcAccessMask = inferAccessMaskFromStage(srcStageMask, true);
-  }
-  if(dstAccessMask == 0)
-  {
-    dstAccessMask = inferAccessMaskFromStage(dstStageMask, false);
-  }
-
-  const std::array<VkBufferMemoryBarrier2, 1> bufferBarrier{{{.sType        = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-                                                              .srcStageMask = srcStageMask,
-                                                              .srcAccessMask       = srcAccessMask,
-                                                              .dstStageMask        = dstStageMask,
-                                                              .dstAccessMask       = dstAccessMask,
-                                                              .srcQueueFamilyIndex = srcQueueFamilyIndex,
-                                                              .dstQueueFamilyIndex = dstQueueFamilyIndex,
-                                                              .buffer              = buffer,
-                                                              .offset              = offset,
-                                                              .size                = size}}};
-
-  const VkDependencyInfo depInfo{.sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                                 .bufferMemoryBarrierCount = uint32_t(bufferBarrier.size()),
-                                 .pBufferMemoryBarriers    = bufferBarrier.data()};
-  vkCmdPipelineBarrier2(commandBuffer, &depInfo);
-}
-
-
-/*--
- * A helper function to find a supported format from a list of candidates.
- * For example, we can use this function to find a supported depth format.
--*/
-static VkFormat findSupportedFormat(VkPhysicalDevice             physicalDevice,
-                                    const std::vector<VkFormat>& candidates,
-                                    VkImageTiling                tiling,
-                                    VkFormatFeatureFlags2        features)
-{
-  for(const VkFormat format : candidates)
-  {
-    VkFormatProperties2 props{.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
-    vkGetPhysicalDeviceFormatProperties2(physicalDevice, format, &props);
-
-    if(tiling == VK_IMAGE_TILING_LINEAR && (props.formatProperties.linearTilingFeatures & features) == features)
-    {
-      return format;
-    }
-    if(tiling == VK_IMAGE_TILING_OPTIMAL && (props.formatProperties.optimalTilingFeatures & features) == features)
-    {
-      return format;
-    }
-  }
-  ASSERT(false, "failed to find supported format!");
-  return VK_FORMAT_UNDEFINED;
-}
-
-/*--
- * A helper function to find the depth format that is supported by the physical device.
--*/
-static VkFormat findDepthFormat(VkPhysicalDevice physicalDevice)
-{
-  return findSupportedFormat(physicalDevice,
-                             {VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT},
-                             VK_IMAGE_TILING_OPTIMAL, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
-}
-
-/*--
- * A helper function to create a shader module from a Spir-V code.
--*/
-static VkShaderModule createShaderModule(VkDevice device, const std::span<const uint32_t>& code)
-{
-  const VkShaderModuleCreateInfo createInfo{.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                            .codeSize = code.size() * sizeof(uint32_t),
-                                            .pCode    = static_cast<const uint32_t*>(code.data())};
-  VkShaderModule                 shaderModule{};
-  VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule));
-  return shaderModule;
-}
-
-//--- Command Buffer ------------------------------------------------------------------------------------------------------------
-
-/*-- Simple helper for the creation of a temporary command buffer, use to record the commands to upload data, or transition images. -*/
-static VkCommandBuffer beginSingleTimeCommands(VkDevice device, VkCommandPool cmdPool)
-{
-  const VkCommandBufferAllocateInfo allocInfo{.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                                              .commandPool        = cmdPool,
-                                              .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                              .commandBufferCount = 1};
-  VkCommandBuffer                   cmd{};
-  VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &cmd));
-  const VkCommandBufferBeginInfo beginInfo{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-  VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
-  return cmd;
-}
-/*-- 
- * Submit the temporary command buffer, wait until the command is finished, and clean up. 
- * This is a blocking function and should be used only for small operations 
---*/
-static void endSingleTimeCommands(VkCommandBuffer cmd, VkDevice device, VkCommandPool cmdPool, VkQueue queue)
-{
-  // Submit and clean up
-  VK_CHECK(vkEndCommandBuffer(cmd));
-
-  // Create fence for synchronization
-  const VkFenceCreateInfo fenceInfo{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-  std::array<VkFence, 1>  fence{};
-  VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, fence.data()));
-
-  const VkCommandBufferSubmitInfo cmdBufferInfo{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cmd};
-  const std::array<VkSubmitInfo2, 1> submitInfo{
-      {{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cmdBufferInfo}}};
-  VK_CHECK(vkQueueSubmit2(queue, uint32_t(submitInfo.size()), submitInfo.data(), fence[0]));
-  VK_CHECK(vkWaitForFences(device, uint32_t(fence.size()), fence.data(), VK_TRUE, UINT64_MAX));
-
-  // Cleanup
-  vkDestroyFence(device, fence[0], nullptr);
-  vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
-}
-
-// Helper to chain Vulkan structures to the pNext chain
-// Uses VkBaseOutStructure for type-safe chaining following Vulkan conventions
-template <typename MainT, typename NewT>
-static void pNextChainPushFront(MainT* mainStruct, NewT* newStruct)
-{
-  // Cast to VkBaseOutStructure for proper pNext handling
-  auto* newBase  = reinterpret_cast<VkBaseOutStructure*>(newStruct);
-  auto* mainBase = reinterpret_cast<VkBaseOutStructure*>(mainStruct);
-
-  newBase->pNext  = mainBase->pNext;
-  mainBase->pNext = newBase;
-}
-
-// Validation settings: to fine tune what is checked
-struct ValidationSettings
-{
-  VkBool32 fine_grained_locking{VK_TRUE};
-  VkBool32 validate_core{VK_TRUE};
-  VkBool32 check_image_layout{VK_TRUE};
-  VkBool32 check_command_buffer{VK_TRUE};
-  VkBool32 check_object_in_use{VK_TRUE};
-  VkBool32 check_query{VK_TRUE};
-  VkBool32 check_shaders{VK_TRUE};
-  VkBool32 check_shaders_caching{VK_TRUE};
-  VkBool32 unique_handles{VK_TRUE};
-  VkBool32 object_lifetime{VK_TRUE};
-  VkBool32 stateless_param{VK_TRUE};
-  std::vector<const char*> debug_action{"VK_DBG_LAYER_ACTION_LOG_MSG"};  // "VK_DBG_LAYER_ACTION_DEBUG_OUTPUT", "VK_DBG_LAYER_ACTION_BREAK"
-  std::vector<const char*> report_flags{"error", "warn"};  // Enable both errors and warnings
-  std::vector<const char*> message_id_filter{"WARNING-legacy-gpdp2"};  // Filter: legacy vkGetPhysicalDeviceProperties warning from third-party libs (ImGui/VMA)
-
-  VkBaseInStructure* buildPNextChain()
-  {
-    layerSettings = std::vector<VkLayerSettingEXT>{
-        {layerName, "fine_grained_locking", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &fine_grained_locking},
-        {layerName, "validate_core", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &validate_core},
-        {layerName, "check_image_layout", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &check_image_layout},
-        {layerName, "check_command_buffer", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &check_command_buffer},
-        {layerName, "check_object_in_use", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &check_object_in_use},
-        {layerName, "check_query", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &check_query},
-        {layerName, "check_shaders", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &check_shaders},
-        {layerName, "check_shaders_caching", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &check_shaders_caching},
-        {layerName, "unique_handles", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &unique_handles},
-        {layerName, "object_lifetime", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &object_lifetime},
-        {layerName, "stateless_param", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &stateless_param},
-        {layerName, "debug_action", VK_LAYER_SETTING_TYPE_STRING_EXT, uint32_t(debug_action.size()), debug_action.data()},
-        {layerName, "report_flags", VK_LAYER_SETTING_TYPE_STRING_EXT, uint32_t(report_flags.size()), report_flags.data()},
-        {layerName, "message_id_filter", VK_LAYER_SETTING_TYPE_STRING_EXT, uint32_t(message_id_filter.size()),
-         message_id_filter.data()},
-
-    };
-    layerSettingsCreateInfo = {
-        .sType        = VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT,
-        .settingCount = uint32_t(layerSettings.size()),
-        .pSettings    = layerSettings.data(),
-    };
-
-    return reinterpret_cast<VkBaseInStructure*>(&layerSettingsCreateInfo);
-  }
-
-  static constexpr const char*   layerName{"VK_LAYER_KHRONOS_validation"};
-  std::vector<VkLayerSettingEXT> layerSettings;
-  VkLayerSettingsCreateInfoEXT   layerSettingsCreateInfo{};
-};
-
-//--- Vulkan Context Configuration ------------------------------------------------------------------------------------------------------------
-
-/*--
- * Configuration for device extensions.
- * - name: The extension name (e.g., VK_KHR_SWAPCHAIN_EXTENSION_NAME)
- * - required: If true, the application will assert if the extension is not available
- * - featureStruct: Pointer to the feature structure to enable (or nullptr if no feature struct needed)
--*/
-struct ExtensionConfig
-{
-  const char* name          = nullptr;
-  bool        required      = false;
-  void*       featureStruct = nullptr;
-};
-
-/*--
- * Configuration structure for Context initialization.
- * This allows customization of instance/device extensions, layers, and features.
- * 
- * Usage:
- *   ContextCreateInfo config;
- *   config.deviceExtensions.push_back({VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME, true, &rtFeatures, VK_STRUCTURE_TYPE_...});
- *   context.init(config);
--*/
-struct ContextCreateInfo
-{
-  // Instance configuration
-  std::vector<const char*> instanceExtensions = {VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME};
-  std::vector<const char*> instanceLayers;
-
-  // API version
-  uint32_t apiVersion = VK_API_VERSION_1_4;
-
-  // Validation layers
-#ifdef NDEBUG
-  bool enableValidationLayers = false;
-#else
-  bool enableValidationLayers = true;
-#endif
-
-  // Device extensions with their configuration
-  // Note: These are the extensions that will be requested from the device
-  // The Context will check availability and enable them based on the 'required' flag
-  std::vector<ExtensionConfig> deviceExtensions;
-};
-
-//--- Vulkan Context ------------------------------------------------------------------------------------------------------------
-
-/*--
- * The context is the main class that holds the Vulkan instance, the physical device, the logical device, and the queue.
- * The instance is the main object that is used to interact with the Vulkan library.
- * The physical device is the GPU that is used to render the scene.
- * The logical device is the interface to the physical device.
- * The queue is used to submit command buffers to the GPU.
- *
- * Extensions and features are configured externally via ContextCreateInfo.
- * The context will check availability and enable them based on the configuration.
--*/
-class Context
-{
-public:
-  Context() = default;
-  ~Context() { assert(m_device == VK_NULL_HANDLE && "Missing destroy()"); }
-
-  void init(const ContextCreateInfo& createInfo)
-  {
-    m_createInfo = createInfo;
-    initInstance();
-    selectPhysicalDevice();
-    initLogicalDevice();
-  }
-
-  // Destroy internal resources and reset its initial state
-  void deinit()
-  {
-    vkDeviceWaitIdle(m_device);
-    if(m_createInfo.enableValidationLayers && vkDestroyDebugUtilsMessengerEXT)
-    {
-      vkDestroyDebugUtilsMessengerEXT(m_instance, m_callback, nullptr);
-    }
-    vkDestroyDevice(m_device, nullptr);
-    vkDestroyInstance(m_instance, nullptr);
-    *this = {};
-  }
-
-  VkDevice         getDevice() const { return m_device; }
-  VkPhysicalDevice getPhysicalDevice() const { return m_physicalDevice; }
-  VkInstance       getInstance() const { return m_instance; }
-  const QueueInfo& getGraphicsQueue() const { return m_queues[0]; }
-  uint32_t         getApiVersion() const { return m_apiVersion; }
-
-
-private:
-  //--- Vulkan Debug ------------------------------------------------------------------------------------------------------------
-
-  /*-- Callback function to catch validation errors  -*/
-  static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                                      VkDebugUtilsMessageTypeFlagsEXT,
-                                                      const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
-                                                      void*)
-  {
-    const Logger::LogLevel level =
-        (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0   ? Logger::LogLevel::eERROR :
-        (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0 ? Logger::LogLevel::eWARNING :
-                                                                            Logger::LogLevel::eINFO;
-    Logger::getInstance().log(level, "%s", callbackData->pMessage);
-    if((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0)
-    {
-#if defined(_MSVC_LANG)
-      __debugbreak();
-#elif defined(__linux__)
-      raise(SIGTRAP);
-#endif
-    }
-    return VK_FALSE;
-  }
-
-  void initInstance()
-  {
-    vkEnumerateInstanceVersion(&m_apiVersion);
-    LOGI("VULKAN API: %d.%d", VK_VERSION_MAJOR(m_apiVersion), VK_VERSION_MINOR(m_apiVersion));
-    ASSERT(m_apiVersion >= VK_MAKE_API_VERSION(0, 1, 4, 0), "Require Vulkan 1.4 loader");
-
-    // This finds the KHR surface extensions needed to display on the right platform
-    uint32_t     glfwExtensionCount = 0;
-    const char** glfwExtensions     = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
-    getAvailableInstanceExtensions();
-
-    const VkApplicationInfo applicationInfo{
-        .pApplicationName   = "minimal_latest",
-        .applicationVersion = 1,
-        .pEngineName        = "minimal_latest",
-        .engineVersion      = 1,
-        .apiVersion         = m_apiVersion,
-    };
-
-    // Build instance extensions list from config
-    std::vector<const char*> instanceExtensions = m_createInfo.instanceExtensions;
-
-    // Add extensions requested by GLFW (required for windowing)
-    for(uint32_t i = 0; i < glfwExtensionCount; i++)
-    {
-      instanceExtensions.push_back(glfwExtensions[i]);
-    }
-
-    // Add optional instance extensions if available
-    if(extensionIsAvailable(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, m_instanceExtensionsAvailable))
-      instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-    if(extensionIsAvailable(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME, m_instanceExtensionsAvailable))
-      instanceExtensions.push_back(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
-
-    // Build instance layers list from config
-    std::vector<const char*> instanceLayers = m_createInfo.instanceLayers;
-
-    // Adding the validation layer
-    if(m_createInfo.enableValidationLayers)
-    {
-      instanceLayers.push_back("VK_LAYER_KHRONOS_validation");
-    }
-
-    // Setting for the validation layer
-    ValidationSettings validationSettings{.validate_core = VK_TRUE};  // modify default value
-
-    const VkInstanceCreateInfo instanceCreateInfo{
-        .sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pNext                   = validationSettings.buildPNextChain(),
-        .pApplicationInfo        = &applicationInfo,
-        .enabledLayerCount       = uint32_t(instanceLayers.size()),
-        .ppEnabledLayerNames     = instanceLayers.data(),
-        .enabledExtensionCount   = uint32_t(instanceExtensions.size()),
-        .ppEnabledExtensionNames = instanceExtensions.data(),
-    };
-
-    // Actual Vulkan instance creation
-    VK_CHECK(vkCreateInstance(&instanceCreateInfo, nullptr, &m_instance));
-
-    // Load all Vulkan functions
-    volkLoadInstance(m_instance);
-
-    // Add the debug callback
-    if(m_createInfo.enableValidationLayers && vkCreateDebugUtilsMessengerEXT)
-    {
-      const VkDebugUtilsMessengerCreateInfoEXT dbg_messenger_create_info{
-          .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-          .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
-          .messageType     = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT,
-          .pfnUserCallback = Context::debugCallback,  // <-- The callback function
-      };
-      VK_CHECK(vkCreateDebugUtilsMessengerEXT(m_instance, &dbg_messenger_create_info, nullptr, &m_callback));
-      LOGI("Validation Layers: ON");
-    }
-  }
-
-  /*--
-   * The physical device is the GPU that is used to render the scene.
-   * We are selecting the first discrete GPU found, if there is one.
-  -*/
-  void selectPhysicalDevice()
-  {
-    size_t chosenDevice = 0;
-
-    uint32_t deviceCount = 0;
-    vkEnumeratePhysicalDevices(m_instance, &deviceCount, nullptr);
-    ASSERT(deviceCount != 0, "failed to find GPUs with Vulkan support!");
-
-    std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
-    vkEnumeratePhysicalDevices(m_instance, &deviceCount, physicalDevices.data());
-
-    VkPhysicalDeviceProperties2 properties2{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    for(size_t i = 0; i < physicalDevices.size(); i++)
-    {
-      vkGetPhysicalDeviceProperties2(physicalDevices[i], &properties2);
-      if(properties2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-      {
-        chosenDevice = i;
-        break;
-      }
-    }
-
-    m_physicalDevice = physicalDevices[chosenDevice];
-    vkGetPhysicalDeviceProperties2(m_physicalDevice, &properties2);
-    LOGI("Selected GPU: %s", properties2.properties.deviceName);  // Show the name of the GPU
-    LOGI("Driver: %d.%d.%d", VK_VERSION_MAJOR(properties2.properties.driverVersion),
-         VK_VERSION_MINOR(properties2.properties.driverVersion), VK_VERSION_PATCH(properties2.properties.driverVersion));
-    LOGI("Vulkan API: %d.%d.%d", VK_VERSION_MAJOR(properties2.properties.apiVersion),
-         VK_VERSION_MINOR(properties2.properties.apiVersion), VK_VERSION_PATCH(properties2.properties.apiVersion));
-    ASSERT(properties2.properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 4, 0), "Require Vulkan 1.4 device, update driver!");
-  }
-
-  /*--
-   * The queue is used to submit command buffers to the GPU.
-   * We are selecting the first queue found (graphic), which is the most common and needed for rendering graphic elements.
-   * 
-   * Other types of queues are used for compute, transfer, and other types of operations.
-   * In a more advanced application, the user should select the queue that fits the application needs.
-   * 
-   * Eventually the user should create multiple queues for different types of operations.
-   * 
-   * Note: The queue is created with the creation of the logical device, this is the selection which are requested when creating the logical device.
-   * Note: the search of the queue could be more advanced, and search for the right queue family.
-  -*/
-  QueueInfo getQueue(VkQueueFlagBits flags) const
-  {
-    uint32_t queueFamilyCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties2(m_physicalDevice, &queueFamilyCount, nullptr);
-    std::vector<VkQueueFamilyProperties2> queueFamilies(queueFamilyCount, {.sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2});
-    vkGetPhysicalDeviceQueueFamilyProperties2(m_physicalDevice, &queueFamilyCount, queueFamilies.data());
-
-    QueueInfo queueInfo;
-    for(uint32_t i = 0; i < queueFamilies.size(); i++)
-    {
-      if(queueFamilies[i].queueFamilyProperties.queueFlags & flags)
-      {
-        queueInfo.familyIndex = i;
-        queueInfo.queueIndex  = 0;  // A second graphic queue could be index 1 (need logic to find the right one)
-        // m_queueInfo.queue = After creating the logical device
-        break;
-      }
-    }
-    return queueInfo;
-  }
-
-  /*--
-   * The logical device is the interface to the physical device.
-   * It is used to create resources, allocate memory, and submit command buffers to the GPU.
-   * The logical device is created with the physical device and the queue family that is used.
-   * The logical device is created with the extensions and features configured in ContextCreateInfo.
-  -*/
-  void initLogicalDevice()
-  {
-    const float queuePriority = 1.0F;
-    m_queues.clear();
-    m_queues.emplace_back(getQueue(VK_QUEUE_GRAPHICS_BIT));
-
-    // Request only one queue : graphic
-    // User could request more specific queues: compute, transfer
-    const VkDeviceQueueCreateInfo queueCreateInfo{
-        .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueFamilyIndex = m_queues[0].familyIndex,
-        .queueCount       = 1,
-        .pQueuePriorities = &queuePriority,
-    };
-
-    // Chaining all features up to Vulkan 1.4
-    pNextChainPushFront(&m_features11, &m_features12);
-    pNextChainPushFront(&m_features11, &m_features13);
-    pNextChainPushFront(&m_features11, &m_features14);
-
-    /*-- 
-     * Process device extensions from configuration:
-     * - Check if each extension is available on the device
-     * - Enable required extensions (assert if not available)
-     * - Enable optional extensions (skip if not available)
-     * - Link provided feature structs to the pNext chain
-    -*/
-    getAvailableDeviceExtensions();
-
-    std::vector<const char*> deviceExtensions;
-    for(const auto& extConfig : m_createInfo.deviceExtensions)
-    {
-      if(extensionIsAvailable(extConfig.name, m_deviceExtensionsAvailable))
-      {
-        deviceExtensions.push_back(extConfig.name);
-
-        // Link feature struct if provided via ExtensionConfig::featureStruct
-        if(extConfig.featureStruct != nullptr)
-        {
-          pNextChainPushFront(&m_features11, extConfig.featureStruct);
-        }
-      }
-      else if(extConfig.required)
-      {
-        // Extension is required but not available - fail with error message
-        LOGE("Required extension %s is not available!", extConfig.name);
-        ASSERT(false, "Required device extension not available, update driver!");
-      }
-      else
-      {
-        // Extension is optional and not available - skip it
-        LOGW("Optional extension %s is not available, skipping", extConfig.name);
-      }
-    }
-
-    // Requesting all supported features, which will then be activated in the device
-    m_deviceFeatures.pNext = &m_features11;
-    vkGetPhysicalDeviceFeatures2(m_physicalDevice, &m_deviceFeatures);
-
-    // Validate required features - these are mandatory in Vulkan 1.4, but some drivers
-    // claim 1.4 support without full conformance. Check to catch non-conformant drivers early.
-    ASSERT(m_features12.timelineSemaphore, "Timeline semaphore required (Vulkan 1.2 core)");
-    ASSERT(m_features13.synchronization2, "Synchronization2 required (Vulkan 1.3 core)");
-    ASSERT(m_features13.dynamicRendering, "Dynamic rendering required (Vulkan 1.3 core)");
-    ASSERT(m_features14.maintenance5, "Maintenance5 required (Vulkan 1.4 core)");
-    ASSERT(m_features14.maintenance6, "Maintenance6 required (Vulkan 1.4 core)");
-
-    // Get information about what the device can do
-    VkPhysicalDeviceProperties2 deviceProperties{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    deviceProperties.pNext = &m_pushDescriptorProperties;
-    vkGetPhysicalDeviceProperties2(m_physicalDevice, &deviceProperties);
-
-    // Create the logical device
-    const VkDeviceCreateInfo deviceCreateInfo{
-        .sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext                   = &m_deviceFeatures,
-        .queueCreateInfoCount    = 1,
-        .pQueueCreateInfos       = &queueCreateInfo,
-        .enabledExtensionCount   = uint32_t(deviceExtensions.size()),
-        .ppEnabledExtensionNames = deviceExtensions.data(),
-    };
-    VK_CHECK(vkCreateDevice(m_physicalDevice, &deviceCreateInfo, nullptr, &m_device));
-    DBG_VK_NAME(m_device);
-
-    volkLoadDevice(m_device);  // Load all Vulkan device functions
-
-    // Debug utility to name Vulkan objects, great in debugger like NSight
-    debugUtilInitialize(m_device);
-
-    // Get the requested queues
-    vkGetDeviceQueue(m_device, m_queues[0].familyIndex, m_queues[0].queueIndex, &m_queues[0].queue);
-    DBG_VK_NAME(m_queues[0].queue);
-
-    // Log the enabled extensions
-    LOGI("Enabled device extensions:");
-    for(const auto& ext : deviceExtensions)
-    {
-      LOGI("  %s", ext);
-    }
-  }
-
-  /*-- 
-   * Get all available extensions for the device, because we cannot request an extension that isn't 
-   * supported/available. If we do, the logical device creation would fail. 
-  -*/
-  void getAvailableDeviceExtensions()
-  {
-    uint32_t count{0};
-    VK_CHECK(vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &count, nullptr));
-    m_deviceExtensionsAvailable.resize(count);
-    VK_CHECK(vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &count, m_deviceExtensionsAvailable.data()));
-  }
-
-  void getAvailableInstanceExtensions()
-  {
-    uint32_t count{0};
-    vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
-    m_instanceExtensionsAvailable.resize(count);
-    vkEnumerateInstanceExtensionProperties(nullptr, &count, m_instanceExtensionsAvailable.data());
-  }
-
-  // Work in conjunction with the above
-  bool extensionIsAvailable(const std::string& name, const std::vector<VkExtensionProperties>& extensions)
-  {
-    for(auto& ext : extensions)
-    {
-      if(name == ext.extensionName)
-        return true;
-    }
-    return false;
-  }
-
-
-  // --- Members ------------------------------------------------------------------------------------------------------------
-  ContextCreateInfo m_createInfo{};   // Configuration provided during init()
-  uint32_t          m_apiVersion{0};  // The Vulkan API version
-
-  // Properties: how much a feature can do
-  VkPhysicalDevicePushDescriptorProperties m_pushDescriptorProperties{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES};
-
-  std::vector<VkBaseOutStructure*> m_linkedDeviceProperties{reinterpret_cast<VkBaseOutStructure*>(&m_pushDescriptorProperties)};
-
-  VkInstance                         m_instance{};        // The Vulkan instance
-  VkPhysicalDevice                   m_physicalDevice{};  // The physical device (GPU)
-  VkDevice                           m_device{};          // The logical device (interface to the physical device)
-  std::vector<QueueInfo>             m_queues;            // The queue used to submit command buffers to the GPU
-  VkDebugUtilsMessengerEXT           m_callback{VK_NULL_HANDLE};  // The debug callback
-  std::vector<VkExtensionProperties> m_instanceExtensionsAvailable;
-  std::vector<VkExtensionProperties> m_deviceExtensionsAvailable;
-
-  // Core features
-  VkPhysicalDeviceFeatures2        m_deviceFeatures{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-  VkPhysicalDeviceVulkan11Features m_features11{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-  VkPhysicalDeviceVulkan12Features m_features12{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-  VkPhysicalDeviceVulkan13Features m_features13{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-  VkPhysicalDeviceVulkan14Features m_features14{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES};
-};
-
-//--- Swapchain ------------------------------------------------------------------------------------------------------------
-/*--
- * Swapchain: The swapchain is responsible for presenting rendered images to the screen.
- * It consists of multiple images (frames) that are cycled through for rendering and display.
- * The swapchain is created with a surface and optional vSync setting, with the
- * window size determined during its setup.
- * "Frames in flight" refers to the number of images being processed concurrently (e.g., double buffering = 2, triple buffering = 3).
- * vSync enabled (FIFO mode) uses double buffering, while disabling vSync  (MAILBOX mode) uses triple buffering.
- *
- * The "current frame" is the frame currently being processed.
- * The "next image index" points to the swapchain image that will be rendered next, which might differ from the current frame's index.
- * If the window is resized or certain conditions are met, the swapchain needs to be recreated (`needRebuild` flag).
--*/
-class Swapchain
-{
-public:
-  Swapchain() = default;
-  ~Swapchain() { assert(m_swapChain == VK_NULL_HANDLE && "Missing deinit()"); }
-
-  void        requestRebuild() { m_needRebuild = true; }
-  bool        needRebuilding() const { return m_needRebuild; }
-  VkImage     getImage() const { return m_nextImages[m_frameImageIndex].image; }
-  VkImageView getImageView() const { return m_nextImages[m_frameImageIndex].imageView; }
-  VkFormat    getImageFormat() const { return m_imageFormat; }
-  uint32_t    getMaxFramesInFlight() const { return m_maxFramesInFlight; }
-  VkSemaphore getImageAvailableSemaphore() const
-  {
-    return m_frameResources[m_frameResourceIndex].imageAvailableSemaphore;
-  }
-  VkSemaphore getRenderFinishedSemaphore() const { return m_frameResources[m_frameImageIndex].renderFinishedSemaphore; }
-
-  // Initialize the swapchain with the provided context and surface, then we can create and re-create it
-  void init(VkPhysicalDevice physicalDevice, VkDevice device, const QueueInfo& queue, VkSurfaceKHR surface, VkCommandPool cmdPool)
-  {
-    m_physicalDevice = physicalDevice;
-    m_device         = device;
-    m_queue          = queue;
-    m_surface        = surface;
-    m_cmdPool        = cmdPool;
-  }
-
-  // Destroy internal resources and reset its initial state
-  void deinit()
-  {
-    deinitResources();
-    *this = {};
-  }
-
-  /*--
-   * Create the swapchain using the provided context, surface, and vSync option. The actual window size is returned.
-   * Queries the GPU capabilities, selects the best surface format and present mode, and creates the swapchain accordingly.
-  -*/
-  VkExtent2D initResources(bool vSync = true)
-  {
-    VkExtent2D outWindowSize;
-
-    // Query the physical device's capabilities for the given surface.
-    const VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo2{.sType   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
-                                                       .surface = m_surface};
-    VkSurfaceCapabilities2KHR             capabilities2{.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};
-    vkGetPhysicalDeviceSurfaceCapabilities2KHR(m_physicalDevice, &surfaceInfo2, &capabilities2);
-
-    uint32_t formatCount = 0;
-    vkGetPhysicalDeviceSurfaceFormats2KHR(m_physicalDevice, &surfaceInfo2, &formatCount, nullptr);
-    std::vector<VkSurfaceFormat2KHR> formats(formatCount, {.sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR});
-    vkGetPhysicalDeviceSurfaceFormats2KHR(m_physicalDevice, &surfaceInfo2, &formatCount, formats.data());
-
-    uint32_t presentModeCount = 0;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(m_physicalDevice, m_surface, &presentModeCount, nullptr);
-    std::vector<VkPresentModeKHR> presentModes(presentModeCount);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(m_physicalDevice, m_surface, &presentModeCount, presentModes.data());
-
-    // Choose the best available surface format and present mode
-    const VkSurfaceFormat2KHR surfaceFormat2 = selectSwapSurfaceFormat(formats);
-    const VkPresentModeKHR    presentMode    = selectSwapPresentMode(presentModes, vSync);
-    // Set the window size according to the surface's current extent
-    outWindowSize = capabilities2.surfaceCapabilities.currentExtent;
-
-    // Adjust the number of images in flight within GPU limitations
-    uint32_t minImageCount       = capabilities2.surfaceCapabilities.minImageCount;  // Vulkan-defined minimum
-    uint32_t preferredImageCount = std::max(3u, minImageCount);  // Prefer 3, but respect minImageCount
-
-    // Handle the maxImageCount case where 0 means "no upper limit"
-    uint32_t maxImageCount = (capabilities2.surfaceCapabilities.maxImageCount == 0) ? preferredImageCount :  // No upper limit, use preferred
-                                 capabilities2.surfaceCapabilities.maxImageCount;
-
-    // Clamp preferredImageCount to valid range [minImageCount, maxImageCount]
-    m_maxFramesInFlight = std::clamp(preferredImageCount, minImageCount, maxImageCount);
-
-    // Store the chosen image format
-    m_imageFormat = surfaceFormat2.surfaceFormat.format;
-
-    // Create the swapchain itself
-    const VkSwapchainCreateInfoKHR swapchainCreateInfo{
-        .sType            = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-        .surface          = m_surface,
-        .minImageCount    = m_maxFramesInFlight,
-        .imageFormat      = surfaceFormat2.surfaceFormat.format,
-        .imageColorSpace  = surfaceFormat2.surfaceFormat.colorSpace,
-        .imageExtent      = capabilities2.surfaceCapabilities.currentExtent,
-        .imageArrayLayers = 1,
-        .imageUsage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .preTransform     = capabilities2.surfaceCapabilities.currentTransform,
-        .compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-        .presentMode      = presentMode,
-        .clipped          = VK_TRUE,
-    };
-    VK_CHECK(vkCreateSwapchainKHR(m_device, &swapchainCreateInfo, nullptr, &m_swapChain));
-    DBG_VK_NAME(m_swapChain);
-
-    // Retrieve the swapchain images
-    {
-      uint32_t imageCount = 0;
-      vkGetSwapchainImagesKHR(m_device, m_swapChain, &imageCount, nullptr);
-      ASSERT(m_maxFramesInFlight <= imageCount, "Wrong swapchain setup");
-      m_maxFramesInFlight = imageCount;  // Use the number of images in the swapchain
-    }
-    std::vector<VkImage> swapImages(m_maxFramesInFlight);
-    vkGetSwapchainImagesKHR(m_device, m_swapChain, &m_maxFramesInFlight, swapImages.data());
-
-    // Store the swapchain images and create views for them
-    m_nextImages.resize(m_maxFramesInFlight);
-    VkImageViewCreateInfo imageViewCreateInfo{
-        .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format   = m_imageFormat,
-        .components = {.r = VK_COMPONENT_SWIZZLE_IDENTITY, .g = VK_COMPONENT_SWIZZLE_IDENTITY, .b = VK_COMPONENT_SWIZZLE_IDENTITY, .a = VK_COMPONENT_SWIZZLE_IDENTITY},
-        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1},
-    };
-    for(uint32_t i = 0; i < m_maxFramesInFlight; i++)
-    {
-      m_nextImages[i].image = swapImages[i];
-      DBG_VK_NAME(m_nextImages[i].image);
-      imageViewCreateInfo.image = m_nextImages[i].image;
-      VK_CHECK(vkCreateImageView(m_device, &imageViewCreateInfo, nullptr, &m_nextImages[i].imageView));
-      DBG_VK_NAME(m_nextImages[i].imageView);
-    }
-
-    // Initialize frame resources for each frame
-    m_frameResources.resize(m_maxFramesInFlight);
-    for(size_t i = 0; i < m_maxFramesInFlight; ++i)
-    {
-      /*--
-       * The sync objects are used to synchronize the rendering with the presentation.
-       * The image available semaphore is signaled when the image is available to render.
-       * The render finished semaphore is signaled when the rendering is finished.
-       * The in flight fence is signaled when the frame is in flight.
-      -*/
-      const VkSemaphoreCreateInfo semaphoreCreateInfo{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-      VK_CHECK(vkCreateSemaphore(m_device, &semaphoreCreateInfo, nullptr, &m_frameResources[i].imageAvailableSemaphore));
-      DBG_VK_NAME(m_frameResources[i].imageAvailableSemaphore);
-      VK_CHECK(vkCreateSemaphore(m_device, &semaphoreCreateInfo, nullptr, &m_frameResources[i].renderFinishedSemaphore));
-      DBG_VK_NAME(m_frameResources[i].renderFinishedSemaphore);
-    }
-
-    // Transition images to present layout
-    {
-      VkCommandBuffer cmd = utils::beginSingleTimeCommands(m_device, m_cmdPool);
-      for(uint32_t i = 0; i < m_maxFramesInFlight; i++)
-      {
-        cmdTransitionSwapchainLayout(cmd, m_nextImages[i].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-      }
-      utils::endSingleTimeCommands(cmd, m_device, m_cmdPool, m_queue.queue);
-    }
-
-    return outWindowSize;
-  }
-
-  /*--
-   * Recreate the swapchain, typically after a window resize or when it becomes invalid.
-   * This waits for all rendering to be finished before destroying the old swapchain and creating a new one.
-  -*/
-  VkExtent2D reinitResources(bool vSync = true)
-  {
-    // Wait for all frames to finish rendering before recreating the swapchain
-    vkQueueWaitIdle(m_queue.queue);
-
-    m_frameResourceIndex = 0;
-    m_needRebuild        = false;
-    deinitResources();
-    return initResources(vSync);
-  }
-
-  /*--
-   * Destroy the swapchain and its associated resources.
-   * This function is also called when the swapchain needs to be recreated.
-  -*/
-  void deinitResources()
-  {
-    vkDestroySwapchainKHR(m_device, m_swapChain, nullptr);
-    for(auto& frameRes : m_frameResources)
-    {
-      vkDestroySemaphore(m_device, frameRes.imageAvailableSemaphore, nullptr);
-      vkDestroySemaphore(m_device, frameRes.renderFinishedSemaphore, nullptr);
-    }
-    for(auto& image : m_nextImages)
-    {
-      vkDestroyImageView(m_device, image.imageView, nullptr);
-    }
-  }
-
-  /*--
-   * Prepares the command buffer for recording rendering commands.
-   * This function handles synchronization with the previous frame and acquires the next image from the swapchain.
-   * The command buffer is reset, ready for new rendering commands.
-  -*/
-  VkResult acquireNextImage(VkDevice device)
-  {
-    ASSERT(m_needRebuild == false, "Swapbuffer need to call reinitResources()");
-
-    auto& frame = m_frameResources[m_frameResourceIndex];
-
-    // Acquire the next image from the swapchain
-    const VkResult result = vkAcquireNextImageKHR(device, m_swapChain, std::numeric_limits<uint64_t>::max(),
-                                                  frame.imageAvailableSemaphore, VK_NULL_HANDLE, &m_frameImageIndex);
-#ifdef NVVK_SEMAPHORE_DEBUG
-    LOGI("AcquireNextImage: \t frameRes=%u imageIndex=%u", m_frameResourceIndex, m_frameImageIndex);
-#endif
-    // Handle special case if the swapchain is out of date (e.g., window resize)
-    if(result == VK_ERROR_OUT_OF_DATE_KHR)
-    {
-      m_needRebuild = true;  // Swapchain must be rebuilt on the next frame
-    }
-    else
-    {
-      ASSERT(result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR, "Couldn't aquire swapchain image");
-    }
-    return result;
-  }
-
-  /*--
-   * Presents the rendered image to the screen.
-   * The semaphore ensures that the image is presented only after rendering is complete.
-   * Advances to the next frame in the cycle.
-  -*/
-  void presentFrame(VkQueue queue)
-  {
-    auto& frame = m_frameResources[m_frameImageIndex];
-
-    // Setup the presentation info, linking the swapchain and the image index
-    const VkPresentInfoKHR presentInfo{
-        .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .waitSemaphoreCount = 1,                               // Wait for rendering to finish
-        .pWaitSemaphores    = &frame.renderFinishedSemaphore,  // Synchronize presentation
-        .swapchainCount     = 1,                               // Swapchain to present the image
-        .pSwapchains        = &m_swapChain,                    // Pointer to the swapchain
-        .pImageIndices      = &m_frameImageIndex,              // Index of the image to present
-    };
-
-    // Present the image and handle potential resizing issues
-    const VkResult result = vkQueuePresentKHR(queue, &presentInfo);
-#ifdef NVVK_SEMAPHORE_DEBUG
-    LOGI("PresentFrame: \t\t frameRes=%u imageIndex=%u", m_frameResourceIndex, m_frameImageIndex);
-#endif
-    // If the swapchain is out of date (e.g., window resized), it needs to be rebuilt
-    if(result == VK_ERROR_OUT_OF_DATE_KHR)
-    {
-      m_needRebuild = true;
-    }
-    else
-    {
-      ASSERT(result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR, "Couldn't present swapchain image");
-    }
-
-    // Advance to the next frame in the swapchain
-    m_frameResourceIndex = (m_frameResourceIndex + 1) % m_maxFramesInFlight;
-  }
-
-private:
-  // Represents an image within the swapchain that can be rendered to.
-  struct Image
-  {
-    VkImage     image{};      // Image to render to
-    VkImageView imageView{};  // Image view to access the image
-  };
-  /*--
-   * Resources associated with each frame being processed.
-   * Each frame has its own set of resources, mainly synchronization primitives
-  -*/
-  struct FrameResources
-  {
-    VkSemaphore imageAvailableSemaphore{};  // Signals when the image is ready for rendering
-    VkSemaphore renderFinishedSemaphore{};  // Signals when rendering is finished
-  };
-
-  // We choose the format that is the most common, and that is supported by* the physical device.
-  VkSurfaceFormat2KHR selectSwapSurfaceFormat(const std::vector<VkSurfaceFormat2KHR>& availableFormats) const
-  {
-    // If there's only one available format and it's undefined, return a default format.
-    if(availableFormats.size() == 1 && availableFormats[0].surfaceFormat.format == VK_FORMAT_UNDEFINED)
-    {
-      VkSurfaceFormat2KHR result{.sType         = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR,
-                                 .surfaceFormat = {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}};
-      return result;
-    }
-
-    const auto preferredFormats = std::to_array<VkSurfaceFormat2KHR>({
-        {.sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR, .surfaceFormat = {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}},
-        {.sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR, .surfaceFormat = {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}},
-    });
-
-    // Check available formats against the preferred formats.
-    for(const auto& preferredFormat : preferredFormats)
-    {
-      for(const auto& availableFormat : availableFormats)
-      {
-        if(availableFormat.surfaceFormat.format == preferredFormat.surfaceFormat.format
-           && availableFormat.surfaceFormat.colorSpace == preferredFormat.surfaceFormat.colorSpace)
-        {
-          return availableFormat;  // Return the first matching preferred format.
-        }
-      }
-    }
-
-    // If none of the preferred formats are available, return the first available format.
-    return availableFormats[0];
-  }
-
-  /*--
-   * The present mode is chosen based on the vSync option
-   * The FIFO mode is the most common, and is used when vSync is enabled.
-   * The MAILBOX mode is used when vSync is disabled, and is the best mode for triple buffering.
-   * The IMMEDIATE mode is used when vSync is disabled, and is the best mode for low latency.
-  -*/
-  VkPresentModeKHR selectSwapPresentMode(const std::vector<VkPresentModeKHR>& availablePresentModes, bool vSync = true)
-  {
-    if(vSync)
-    {
-      return VK_PRESENT_MODE_FIFO_KHR;
-    }
-
-    bool mailboxSupported = false, immediateSupported = false;
-
-    for(VkPresentModeKHR mode : availablePresentModes)
-    {
-      if(mode == VK_PRESENT_MODE_MAILBOX_KHR)
-        mailboxSupported = true;
-      if(mode == VK_PRESENT_MODE_IMMEDIATE_KHR)
-        immediateSupported = true;
-    }
-
-    if(mailboxSupported)
-    {
-      return VK_PRESENT_MODE_MAILBOX_KHR;
-    }
-
-    if(immediateSupported)
-    {
-      return VK_PRESENT_MODE_IMMEDIATE_KHR;  // Best mode for low latency
-    }
-
-    return VK_PRESENT_MODE_FIFO_KHR;  // Fallback to FIFO if neither MAILBOX nor IMMEDIATE is available
-  }
-
-private:
-  VkPhysicalDevice m_physicalDevice{};  // The physical device (GPU)
-  VkDevice         m_device{};          // The logical device (interface to the physical device)
-  QueueInfo        m_queue{};           // The queue used to submit command buffers to the GPU
-  VkSwapchainKHR   m_swapChain{};       // The swapchain
-  VkFormat         m_imageFormat{};     // The format of the swapchain images
-  VkSurfaceKHR     m_surface{};         // The surface to present images to
-  VkCommandPool    m_cmdPool{};         // The command pool for the swapchain
-
-  std::vector<Image>          m_nextImages;
-  std::vector<FrameResources> m_frameResources;
-  uint32_t                    m_frameResourceIndex = 0;
-  uint32_t                    m_frameImageIndex    = 0;
-  bool                        m_needRebuild        = false;
-
-  uint32_t m_maxFramesInFlight = 3;  // Best for pretty much all cases
-};
-
-//--- Frame Pacer ------------------------------------------------------------------------------------------------------------
-// This is a simple frame pacer to limit the frame rate to the target FPS.
-// This significantly helps with latency (from interaction to seeing the update
-// on screen) when VSync is on.
-// Try this: Enable VSync and rapidly change the clear color using your mouse.
-//           Now do the same without this frame pacer; you'll see that without
-//           the pacer, the clear color lags behind the mouse by several frames.
-//
-// The core idea here is that when VSync is on, the screen only displays one
-// image per VSync. So if we rendered faster, we'd either queue up too many
-// frames in the swapchain (VK_PRESENT_MODE_FIFO) or use too much power by
-// rendering frames that are never displayed (some VK_PRESENT_MODE_MAILBOX
-// implementations). Since the compositor consumes only one image per VSync,
-// we should render only at most one image per VSync.
-class FramePacer
-{
-public:
-  FramePacer()  = default;
-  ~FramePacer() = default;
-
-  // Frame rate limiting to monitor refresh rate
-  void paceFrame(double targetFPS = 60.0)
-  {
-    const auto targetFrameTime = std::chrono::duration<double>(1.0 / targetFPS);
-
-    // Pacing the CPU by enforcing at least `refreshInterval` seconds between
-    // frames is all we need! If the GPU is fast things are OK; if the GPU is
-    // slow then vkWaitSemaphores will take more time in the frame, which
-    // will be counted in the CPU time.
-    const auto currentTime   = std::chrono::high_resolution_clock::now();
-    const auto frameDuration = currentTime - m_lastFrameTime;
-    auto       sleepTime     = targetFrameTime - frameDuration;
-#ifdef _WIN32
-    // On Windows, we know that 1ms is just about the right time to subtract;
-    // it's just under the average amount that Windows adds to the sleep call.
-    // On Linux the timers are accurate enough that we don't need this.
-    sleepTime -= std::chrono::duration<double>(std::chrono::milliseconds(1));
-#endif
-    if(sleepTime > std::chrono::duration<double>(0))
-    {
-#ifdef _WIN32
-      // On Windows, the default timer might quantize to 15.625 ms; see
-      // https://randomascii.wordpress.com/2020/10/04/windows-timer-resolution-the-great-rule-change/ .
-      // We use timeBeginPeriod to temporarily increase the resolution to 1 ms.
-      timeBeginPeriod(1);
-#endif
-      std::this_thread::sleep_for(sleepTime);
-#ifdef _WIN32
-      timeEndPeriod(1);
-#endif
-    }
-
-    m_lastFrameTime = std::chrono::high_resolution_clock::now();
-  }
-
-private:
-  std::chrono::high_resolution_clock::time_point m_lastFrameTime;
-};
-
-// Helper to return the minimum refresh rate of all monitors.
-static double getMonitorsMinRefreshRate()
-{
-  // We need our target frame rate. We get this once per frame in case the
-  // user changes their monitor's frame rate.
-  // Ideally we'd get the exact composition rate for the current swapchain;
-  // VK_EXT_present_timing will hopefully give us that when it's released.
-  // Currently we use GLFW; this means we don't need anything
-  // platform-specific, but means we only get an integer frame rate,
-  // rounded down, across monitors. We take the minimum to avoid building up
-  // frame latency.
-  double refreshRate = std::numeric_limits<double>::infinity();
-  {
-    int           numMonitors = 0;
-    GLFWmonitor** monitors    = glfwGetMonitors(&numMonitors);
-    for(int i = 0; i < numMonitors; i++)
-    {
-      const GLFWvidmode* videoMode = glfwGetVideoMode(monitors[i]);
-      if(videoMode)
-      {
-        refreshRate = std::min(refreshRate, static_cast<double>(videoMode->refreshRate));
-      }
-    }
-  }
-  // If we have no information about the frame rate or an impossible value,
-  // use a default.
-  if(std::isinf(refreshRate) || refreshRate <= 0.0)
-  {
-    refreshRate = 60.0;
-  }
-
-  return refreshRate;
-}
-
-//--- Resource Allocator ------------------------------------------------------------------------------------------------------------
-/*--
- * Vulkan Memory Allocator (VMA) is a library that helps to manage memory in Vulkan.
- * This should be used to manage the memory of the resources instead of using the Vulkan API directly.
--*/
-class ResourceAllocator
-{
-public:
-  ResourceAllocator() = default;
-  ~ResourceAllocator() { assert(m_allocator == nullptr && "Missing deinit()"); }
-  operator VmaAllocator() const { return m_allocator; }
-
-  // Initialization of VMA allocator.
-  void init(VmaAllocatorCreateInfo allocatorInfo)
-  {
-    // #TODO : VK_EXT_memory_priority ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT
-
-    allocatorInfo.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;  // allow querying for the GPU address of a buffer
-    allocatorInfo.flags |= VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE4_BIT;
-    allocatorInfo.flags |= VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE5_BIT;  // allow using VkBufferUsageFlags2CreateInfoKHR
-
-    m_device = allocatorInfo.device;
-    // Because we use VMA_DYNAMIC_VULKAN_FUNCTIONS
-    const VmaVulkanFunctions functions = {
-        .vkGetInstanceProcAddr = vkGetInstanceProcAddr,
-        .vkGetDeviceProcAddr   = vkGetDeviceProcAddr,
-    };
-    allocatorInfo.pVulkanFunctions = &functions;
-    vmaCreateAllocator(&allocatorInfo, &m_allocator);
-  }
-
-  // De-initialization of VMA allocator.
-  void deinit()
-  {
-    if(!m_stagingBuffers.empty())
-      LOGW("Warning: Staging buffers were not freed before destroying the allocator");
-    freeStagingBuffers();
-    vmaDestroyAllocator(m_allocator);
-    *this = {};
-  }
-
-  /*-- Create a buffer -*/
-  /* 
-   * UBO: VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
-   *        + VMA_MEMORY_USAGE_CPU_TO_GPU
-   * SSBO: VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-   *        + VMA_MEMORY_USAGE_CPU_TO_GPU // Use this if the CPU will frequently update the buffer
-   *        + VMA_MEMORY_USAGE_GPU_ONLY // Use this if the CPU will rarely update the buffer
-   *        + VMA_MEMORY_USAGE_GPU_TO_CPU  // Use this when you need to read back data from the SSBO to the CPU
-   *      ----
-   *        + VMA_ALLOCATION_CREATE_MAPPED_BIT // Automatically maps the buffer upon creation
-   *        + VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT // If the CPU will sequentially write to the buffer's memory,
-   */
-  Buffer createBuffer(VkDeviceSize             size,
-                      VkBufferUsageFlags2KHR   usage,
-                      VmaMemoryUsage           memoryUsage  = VMA_MEMORY_USAGE_AUTO,
-                      VmaAllocationCreateFlags flags        = {},
-                      VkDeviceSize             minAlignment = {}) const
-  {
-    // This can be used only with maintenance5
-    const VkBufferUsageFlags2CreateInfoKHR bufferUsageFlags2CreateInfo{
-        .sType = VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR,
-        .usage = usage | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT_KHR,
-    };
-
-    const VkBufferCreateInfo bufferInfo{
-        .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .pNext       = &bufferUsageFlags2CreateInfo,
-        .size        = size,
-        .usage       = 0,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,  // Only one queue family will access i
-    };
-
-    VmaAllocationCreateInfo allocInfo              = {.flags = flags, .usage = memoryUsage};
-    const VkDeviceSize      dedicatedMemoryMinSize = 64ULL * 1024;  // 64 KB
-    if(size > dedicatedMemoryMinSize)
-    {
-      allocInfo.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;  // Use dedicated memory for large buffers
-    }
-
-    // Create the buffer
-    Buffer            resultBuffer;
-    VmaAllocationInfo allocInfoOut{};
-    VK_CHECK(vmaCreateBufferWithAlignment(m_allocator, &bufferInfo, &allocInfo, minAlignment, &resultBuffer.buffer,
-                                          &resultBuffer.allocation, &allocInfoOut));
-
-    // Get the GPU address of the buffer
-    const VkBufferDeviceAddressInfo info = {.sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
-                                            .buffer = resultBuffer.buffer};
-    resultBuffer.address                 = vkGetBufferDeviceAddress(m_device, &info);
-
-    {  // Find leaks
-      static uint32_t counter = 0U;
-      if(m_leakID == counter)
-      {
-#if defined(_MSVC_LANG)
-        __debugbreak();
-#endif
-      }
-      std::string allocID = std::string("allocID: ") + std::to_string(counter++);
-      vmaSetAllocationName(m_allocator, resultBuffer.allocation, allocID.c_str());
-    }
-
-    return resultBuffer;
-  }
-
-  //*-- Destroy a buffer -*/
-  void destroyBuffer(Buffer buffer) const { vmaDestroyBuffer(m_allocator, buffer.buffer, buffer.allocation); }
-
-  /*--
-   * Create a staging buffer, copy data into it, and track it.
-   * This method accepts data, handles the mapping, copying, and unmapping
-   * automatically.
-  -*/
-  template <typename T>
-  Buffer createStagingBuffer(const std::span<T>& vectorData)
-  {
-    const VkDeviceSize bufferSize = sizeof(T) * vectorData.size();
-
-    // Create a staging buffer
-    Buffer stagingBuffer = createBuffer(bufferSize, VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT_KHR, VMA_MEMORY_USAGE_CPU_TO_GPU,
-                                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
-
-    // Track the staging buffer for later cleanup
-    m_stagingBuffers.push_back(stagingBuffer);
-
-    // Map and copy data to the staging buffer
-    void* data = nullptr;
-    vmaMapMemory(m_allocator, stagingBuffer.allocation, &data);
-    memcpy(data, vectorData.data(), (size_t)bufferSize);
-    vmaUnmapMemory(m_allocator, stagingBuffer.allocation);
-    return stagingBuffer;
-  }
-
-  /*--
-   * Create a buffer (GPU only) with data, this is done using a staging buffer
-   * The staging buffer is a buffer that is used to transfer data from the CPU
-   * to the GPU.
-   * and cannot be freed until the data is transferred. So the command buffer
-   * must be submitted, then
-   * the staging buffer can be cleared using the freeStagingBuffers function.
-  -*/
-  template <typename T>
-  Buffer createBufferAndUploadData(VkCommandBuffer          cmd,
-                                   const std::span<T>&      vectorData,
-                                   VkBufferUsageFlags2KHR   usageFlags,
-                                   VmaAllocationCreateFlags flags        = {},
-                                   VkDeviceSize             minAlignment = {})
-  {
-    // Create staging buffer and upload data
-    Buffer stagingBuffer = createStagingBuffer(vectorData);
-
-    // Create the final buffer in GPU memory
-    const VkDeviceSize bufferSize = sizeof(T) * vectorData.size();
-    Buffer             buffer     = createBuffer(bufferSize, usageFlags | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR,
-                                                 VMA_MEMORY_USAGE_GPU_ONLY, flags, minAlignment);
-
-    const std::array<VkBufferCopy, 1> copyRegion{{{.size = bufferSize}}};
-    vkCmdCopyBuffer(cmd, stagingBuffer.buffer, buffer.buffer, uint32_t(copyRegion.size()), copyRegion.data());
-
-    return buffer;
-  }
-
-  /*--
-   * Create an image in GPU memory. This does not adding data to the image.
-   * This is only creating the image in GPU memory.
-   * See createImageAndUploadData for creating an image and uploading data.
-  -*/
-  Image createImage(const VkImageCreateInfo& imageInfo) const
-  {
-    const VmaAllocationCreateInfo createInfo{.usage = VMA_MEMORY_USAGE_GPU_ONLY};
-
-    Image             image;
-    VmaAllocationInfo allocInfo{};
-    VK_CHECK(vmaCreateImage(m_allocator, &imageInfo, &createInfo, &image.image, &image.allocation, &allocInfo));
-    return image;
-  }
-
-  /*-- Destroy image --*/
-  void destroyImage(Image& image) const { vmaDestroyImage(m_allocator, image.image, image.allocation); }
-
-  void destroyImageResource(ImageResource& imageRessource) const { destroyImage(imageRessource); }
-
-  /*-- Create an image and upload data using a staging buffer --*/
-  template <typename T>
-  ImageResource createImageAndUploadData(VkCommandBuffer cmd, const std::span<T>& vectorData, const VkImageCreateInfo& _imageInfo, VkImageLayout finalLayout)
-  {
-    // Create staging buffer and upload data
-    Buffer stagingBuffer = createStagingBuffer(vectorData);
-
-    // Create image in GPU memory
-    VkImageCreateInfo imageInfo = _imageInfo;
-    imageInfo.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // We will copy data to this image
-    Image image = createImage(imageInfo);
-
-    // Transition image layout for copying data
-    cmdInitImageLayout(cmd, image.image);
-
-    // Copy buffer data to the image
-    const std::array<VkBufferImageCopy, 1> copyRegion{
-        {{.imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1}, .imageExtent = imageInfo.extent}}};
-
-    vkCmdCopyBufferToImage(cmd, stagingBuffer.buffer, image.image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(copyRegion.size()),
-                           copyRegion.data());
-
-    ImageResource resultImage(image);
-    resultImage.layout = finalLayout;
-    return resultImage;
-  }
-
-  /*--
-   * The staging buffers are buffers that are used to transfer data from the CPU to the GPU.
-   * They cannot be freed until the data is transferred. So the command buffer must be completed, then the staging buffer can be cleared.
-  -*/
-  void freeStagingBuffers()
-  {
-    for(const auto& buffer : m_stagingBuffers)
-    {
-      destroyBuffer(buffer);
-    }
-    m_stagingBuffers.clear();
-  }
-
-  /*-- When leak are reported, set the ID of the leak here --*/
-  void setLeakID(uint32_t id) { m_leakID = id; }
-
-private:
-  VmaAllocator        m_allocator{};
-  VkDevice            m_device{};
-  std::vector<Buffer> m_stagingBuffers;
-  uint32_t            m_leakID = ~0U;
-};
-
-/*--
- * Samplers are limited in Vulkan.
- * This class is used to create and store samplers, and to avoid creating the same sampler multiple times.
--*/
-class SamplerPool
-{
-public:
-  SamplerPool() = default;
-  ~SamplerPool() { assert(m_device == VK_NULL_HANDLE && "Missing deinit()"); }
-  // Initialize the sampler pool with the device reference, then we can later acquire samplers
-  void init(VkDevice device) { m_device = device; }
-  // Destroy internal resources and reset its initial state
-  void deinit()
-  {
-    for(const auto& entry : m_samplerMap)
-    {
-      vkDestroySampler(m_device, entry.second, nullptr);
-    }
-    m_samplerMap.clear();
-    *this = {};
-  }
-  // Get or create VkSampler based on VkSamplerCreateInfo
-  VkSampler acquireSampler(const VkSamplerCreateInfo& createInfo)
-  {
-    if(auto it = m_samplerMap.find(createInfo); it != m_samplerMap.end())
-    {
-      // If found, return existing sampler
-      return it->second;
-    }
-
-    // Otherwise, create a new sampler
-    VkSampler newSampler     = createSampler(createInfo);
-    m_samplerMap[createInfo] = newSampler;
-    return newSampler;
-  }
-
-  void releaseSampler(VkSampler sampler)
-  {
-    for(auto it = m_samplerMap.begin(); it != m_samplerMap.end();)
-    {
-      if(it->second == sampler)
-      {
-        vkDestroySampler(m_device, it->second, nullptr);
-        it = m_samplerMap.erase(it);
-      }
-      else
-      {
-        ++it;
-      }
-    }
-  }
-
-  // Descriptor heap variant: returns a deduplicated heap index for a given VkSamplerCreateInfo.
-  // Identical create-infos share the same index (ref-counted).
-  uint32_t acquireSamplerDescriptor(const VkSamplerCreateInfo& createInfo)
-  {
-    if(auto it = m_descriptorMap.find(createInfo); it != m_descriptorMap.end())
-    {
-      ++it->second.refCount;
-      return it->second.index;
-    }
-
-    uint32_t newIndex{};
-    if(!m_freeDescriptorIndices.empty())
-    {
-      newIndex = m_freeDescriptorIndices.back();
-      m_freeDescriptorIndices.pop_back();
-    }
-    else
-    {
-      newIndex = m_nextDescriptorIndex++;
-    }
-
-    m_descriptorMap[createInfo]      = {newIndex, 1};
-    m_descriptorReverseMap[newIndex] = createInfo;
-    return newIndex;
-  }
-
-  // Release a previously acquired descriptor heap index.
-  // When the last reference is released, the index is recycled for future use.
-  void releaseSamplerDescriptor(uint32_t index)
-  {
-    auto revIt = m_descriptorReverseMap.find(index);
-    ASSERT(revIt != m_descriptorReverseMap.end(), "releaseSamplerDescriptor: unknown index");
-
-    auto fwdIt = m_descriptorMap.find(revIt->second);
-    ASSERT(fwdIt != m_descriptorMap.end(), "releaseSamplerDescriptor: inconsistent state");
-
-    if(--fwdIt->second.refCount == 0)
-    {
-      m_descriptorMap.erase(fwdIt);
-      m_descriptorReverseMap.erase(revIt);
-      m_freeDescriptorIndices.push_back(index);
-    }
-  }
-
-private:
-  VkDevice m_device{};
-
-  struct SamplerCreateInfoHash
-  {
-    std::size_t operator()(const VkSamplerCreateInfo& info) const
-    {
-      std::size_t seed{0};
-      seed = hashCombine(seed, info.magFilter);
-      seed = hashCombine(seed, info.minFilter);
-      seed = hashCombine(seed, info.mipmapMode);
-      seed = hashCombine(seed, info.addressModeU);
-      seed = hashCombine(seed, info.addressModeV);
-      seed = hashCombine(seed, info.addressModeW);
-      seed = hashCombine(seed, info.mipLodBias);
-      seed = hashCombine(seed, info.anisotropyEnable);
-      seed = hashCombine(seed, info.maxAnisotropy);
-      seed = hashCombine(seed, info.compareEnable);
-      seed = hashCombine(seed, info.compareOp);
-      seed = hashCombine(seed, info.minLod);
-      seed = hashCombine(seed, info.maxLod);
-      seed = hashCombine(seed, info.borderColor);
-      seed = hashCombine(seed, info.unnormalizedCoordinates);
-
-      return seed;
-    }
-  };
-
-  struct SamplerCreateInfoEqual
-  {
-    bool operator()(const VkSamplerCreateInfo& lhs, const VkSamplerCreateInfo& rhs) const
-    {
-      return std::memcmp(&lhs, &rhs, sizeof(VkSamplerCreateInfo)) == 0;
-    }
-  };
-
-  // Stores unique samplers with their corresponding VkSamplerCreateInfo
-  std::unordered_map<VkSamplerCreateInfo, VkSampler, SamplerCreateInfoHash, SamplerCreateInfoEqual> m_samplerMap;
-
-  // --- Descriptor heap index management ---
-  struct DescriptorEntry
-  {
-    uint32_t index{};
-    uint32_t refCount{};
-  };
-  std::unordered_map<VkSamplerCreateInfo, DescriptorEntry, SamplerCreateInfoHash, SamplerCreateInfoEqual> m_descriptorMap;
-  std::unordered_map<uint32_t, VkSamplerCreateInfo> m_descriptorReverseMap;
-  std::vector<uint32_t>                             m_freeDescriptorIndices;
-  uint32_t                                          m_nextDescriptorIndex = 0;
-
-  // Internal function to create a new VkSampler
-  const VkSampler createSampler(const VkSamplerCreateInfo& createInfo) const
-  {
-    ASSERT(m_device, "Initialization was missing");
-    VkSampler sampler{};
-    VK_CHECK(vkCreateSampler(m_device, &createInfo, nullptr, &sampler));
-    return sampler;
-  }
-};
-
-
-//--- GBuffer ------------------------------------------------------------------------------------------------------------
-
-/*--
- * GBuffer creation info
--*/
-struct GbufferCreateInfo
-{
-  VkDevice                  device{};  // Vulkan Device
-  utils::ResourceAllocator* alloc{};   // Allocator for the images
-  VkExtent2D                size{};    // Width and height of the buffers
-  std::vector<VkFormat>     color;     // Array of formats for each color attachment (as many GBuffers as formats)
-  VkFormat              depth{VK_FORMAT_UNDEFINED};  // Format of the depth buffer (VK_FORMAT_UNDEFINED for no depth)
-  VkSampler             linearSampler{};             // Linear sampler for displaying the images
-  VkSampleCountFlagBits sampleCount{VK_SAMPLE_COUNT_1_BIT};  // MSAA sample count (default: no MSAA)
-};
-
-/*--
- * GBuffer - Multiple render targets with depth management
- * 
- * This class manages multiple color buffers and a depth buffer for deferred rendering or 
- * other multi-target rendering techniques. It supports:
- * - Multiple color attachments with configurable formats
- * - Optional depth buffer
- * - MSAA support
- * - ImGui integration for debug visualization
- * - Automatic resource cleanup
- *
- * The GBuffer images can be used as:
- * - Color/Depth attachments (write)
- * - Texture sampling (read)
- * - Storage images (read/write)
- * - Transfer operations
--*/
-class Gbuffer
-{
-public:
-  Gbuffer() = default;
-  ~Gbuffer() { assert(m_createInfo.device == VK_NULL_HANDLE && "Missing deinit()"); }
-
-  /*--
-   * Initialize the GBuffer with the specified configuration.
-  -*/
-  void init(VkCommandBuffer cmd, const GbufferCreateInfo& createInfo)
-  {
-    ASSERT(m_createInfo.color.empty(), "Missing deinit()");  // The buffer must be cleared before creating a new one
-    m_createInfo = createInfo;                               // Copy the creation info
-    create(cmd);
-  }
-
-  // Destroy internal resources and reset its initial state
-  void deinit()
-  {
-    destroy();
-    *this = {};
-  }
-
-  void update(VkCommandBuffer cmd, VkExtent2D newSize)
-  {
-    if(newSize.width == m_createInfo.size.width && newSize.height == m_createInfo.size.height)
-      return;
-
-    destroy();
-    m_createInfo.size = newSize;
-    create(cmd);
-  }
-
-
-  //--- Getters for the GBuffer resources -------------------------
-  ImTextureID getImTextureID(uint32_t i = 0) const { return reinterpret_cast<ImTextureID>(m_descriptorSet[i]); }
-  VkExtent2D  getSize() const { return m_createInfo.size; }
-  VkImage     getColorImage(uint32_t i = 0) const { return m_res.gBufferColor[i].image; }
-  VkImage     getDepthImage() const { return m_res.gBufferDepth.image; }
-  VkImageView getColorImageView(uint32_t i = 0) const { return m_res.descriptor[i].imageView; }
-  const VkDescriptorImageInfo& getDescriptorImageInfo(uint32_t i = 0) const { return m_res.descriptor[i]; }
-  VkImageView                  getDepthImageView() const { return m_res.depthView; }
-  VkFormat                     getColorFormat(uint32_t i = 0) const { return m_createInfo.color[i]; }
-  VkFormat                     getDepthFormat() const { return m_createInfo.depth; }
-  VkSampleCountFlagBits        getSampleCount() const { return m_createInfo.sampleCount; }
-  float getAspectRatio() const { return float(m_createInfo.size.width) / float(m_createInfo.size.height); }
-
-private:
-  /*--
-   * Create the GBuffer with the specified configuration
-   *
-   * Each color buffer is created with:
-   * - Color attachment usage     : For rendering
-   * - Sampled bit                : For sampling in shaders
-   * - Storage bit                : For compute shader access
-   * - Transfer dst bit           : For clearing/copying
-   * 
-   * The depth buffer is created with:
-   * - Depth/Stencil attachment   : For depth testing
-   * - Sampled bit                : For sampling in shaders
-   *
-   * All images are transitioned to GENERAL layout and cleared to black.
-   * ImGui descriptors are created for debug visualization.
-  -*/
-  void create(VkCommandBuffer cmd)
-  {
-    DebugUtil&          dutil = DebugUtil::getInstance();
-    const VkImageLayout layout{VK_IMAGE_LAYOUT_GENERAL};
-
-    const auto numColor = static_cast<uint32_t>(m_createInfo.color.size());
-
-    m_res.gBufferColor.resize(numColor);
-    m_res.descriptor.resize(numColor);
-    m_res.uiImageViews.resize(numColor);
-    m_descriptorSet.resize(numColor);
-
-    for(uint32_t c = 0; c < numColor; c++)
-    {
-      {  // Color image
-        const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT
-                                        | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        const VkImageCreateInfo info = {
-            .sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .imageType   = VK_IMAGE_TYPE_2D,
-            .format      = m_createInfo.color[c],
-            .extent      = {m_createInfo.size.width, m_createInfo.size.height, 1},
-            .mipLevels   = 1,
-            .arrayLayers = 1,
-            .samples     = m_createInfo.sampleCount,
-            .usage       = usage,
-        };
-        m_res.gBufferColor[c] = m_createInfo.alloc->createImage(info);
-        dutil.setObjectName(m_res.gBufferColor[c].image, "G-Color" + std::to_string(c));
-      }
-      {  // Image color view
-        VkImageViewCreateInfo info = {
-            .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image            = m_res.gBufferColor[c].image,
-            .viewType         = VK_IMAGE_VIEW_TYPE_2D,
-            .format           = m_createInfo.color[c],
-            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1},
-        };
-        vkCreateImageView(m_createInfo.device, &info, nullptr, &m_res.descriptor[c].imageView);
-        dutil.setObjectName(m_res.descriptor[c].imageView, "G-Color" + std::to_string(c));
-
-        // UI Image color view
-        info.components.a = VK_COMPONENT_SWIZZLE_ONE;  // Forcing the VIEW to have a 1 in the alpha channel
-        vkCreateImageView(m_createInfo.device, &info, nullptr, &m_res.uiImageViews[c]);
-        dutil.setObjectName(m_res.uiImageViews[c], "UI G-Color" + std::to_string(c));
-      }
-
-      // Set the sampler for the color attachment
-      m_res.descriptor[c].sampler = m_createInfo.linearSampler;
-    }
-
-    if(m_createInfo.depth != VK_FORMAT_UNDEFINED)
-    {  // Depth buffer
-      const VkImageCreateInfo createInfo = {
-          .sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-          .imageType   = VK_IMAGE_TYPE_2D,
-          .format      = m_createInfo.depth,
-          .extent      = {m_createInfo.size.width, m_createInfo.size.height, 1},
-          .mipLevels   = 1,
-          .arrayLayers = 1,
-          .samples     = m_createInfo.sampleCount,
-          .usage       = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-      };
-      m_res.gBufferDepth = m_createInfo.alloc->createImage(createInfo);
-      dutil.setObjectName(m_res.gBufferDepth.image, "G-Depth");
-
-      // Image depth view
-      const VkImageViewCreateInfo viewInfo = {
-          .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-          .image            = m_res.gBufferDepth.image,
-          .viewType         = VK_IMAGE_VIEW_TYPE_2D,
-          .format           = m_createInfo.depth,
-          .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT, .levelCount = 1, .layerCount = 1},
-      };
-      vkCreateImageView(m_createInfo.device, &viewInfo, nullptr, &m_res.depthView);
-      dutil.setObjectName(m_res.depthView, "G-Depth");
-    }
-
-    {  // Change color image layout
-      for(uint32_t c = 0; c < numColor; c++)
-      {
-        cmdInitImageLayout(cmd, m_res.gBufferColor[c].image);
-        m_res.descriptor[c].imageLayout = layout;
-
-        // Clear to avoid garbage data
-        const VkClearColorValue                      clearValue = {{0.F, 0.F, 0.F, 0.F}};
-        const std::array<VkImageSubresourceRange, 1> range      = {
-            {{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1}}};
-        vkCmdClearColorImage(cmd, m_res.gBufferColor[c].image, layout, &clearValue, uint32_t(range.size()), range.data());
-      }
-
-      // Change depth image layout
-      if(m_createInfo.depth != VK_FORMAT_UNDEFINED)
-      {
-        cmdInitImageLayout(cmd, m_res.gBufferDepth.image, VK_IMAGE_ASPECT_DEPTH_BIT);
-      }
-    }
-
-    // Descriptor Set for ImGUI
-    if((ImGui::GetCurrentContext() != nullptr) && ImGui::GetIO().BackendPlatformUserData != nullptr)
-    {
-      for(size_t d = 0; d < m_res.descriptor.size(); ++d)
-      {
-        m_descriptorSet[d] = ImGui_ImplVulkan_AddTexture(m_createInfo.linearSampler, m_res.uiImageViews[d], layout);
-      }
-    }
-  }
-
-  /*--
-   * Clean up all Vulkan resources
-   * - Images and image views
-   * - Samplers
-   * - ImGui descriptors
-   * 
-   * This must be called before destroying the GBuffer or when
-   * recreating with different parameters
-  -*/
-  void destroy()
-  {
-    if((ImGui::GetCurrentContext() != nullptr) && ImGui::GetIO().BackendPlatformUserData != nullptr)
-    {
-      for(VkDescriptorSet set : m_descriptorSet)
-      {
-        ImGui_ImplVulkan_RemoveTexture(set);
-      }
-      m_descriptorSet.clear();
-    }
-
-    for(utils::Image bc : m_res.gBufferColor)
-    {
-      m_createInfo.alloc->destroyImage(bc);
-    }
-
-    if(m_res.gBufferDepth.image != VK_NULL_HANDLE)
-    {
-      m_createInfo.alloc->destroyImage(m_res.gBufferDepth);
-    }
-
-    vkDestroyImageView(m_createInfo.device, m_res.depthView, nullptr);
-
-    for(const VkDescriptorImageInfo& desc : m_res.descriptor)
-    {
-      vkDestroyImageView(m_createInfo.device, desc.imageView, nullptr);
-    }
-
-    for(const VkImageView& view : m_res.uiImageViews)
-    {
-      vkDestroyImageView(m_createInfo.device, view, nullptr);
-    }
-  }
-
-
-  /*--
-   * Resources holds all Vulkan objects for the GBuffer
-   * This separation makes it easier to cleanup and recreate resources
-  -*/
-  struct Resources
-  {
-    std::vector<utils::Image>          gBufferColor;    // Color attachments
-    utils::Image                       gBufferDepth{};  // Optional depth attachment
-    VkImageView                        depthView{};     // View for the depth attachment
-    std::vector<VkDescriptorImageInfo> descriptor;      // Descriptor info for each color attachment
-    std::vector<VkImageView>           uiImageViews;    // Special views for ImGui (alpha=1)
-  };
-
-  Resources m_res;  // All Vulkan resources
-
-  GbufferCreateInfo            m_createInfo{};   // Configuration
-  std::vector<VkDescriptorSet> m_descriptorSet;  // ImGui descriptor sets
-};
-
-//--- Other helpers ------------------------------------------------------------------------------------------------------------
-
-
-/*--
- * Return the path to a file if it exists in one of the search paths.
--*/
-static std::string findFile(const std::string& filename, const std::vector<std::string>& searchPaths)
-{
-  for(const auto& path : searchPaths)
-  {
-    const std::filesystem::path filePath = std::filesystem::path(path) / filename;
-    if(std::filesystem::exists(filePath))
-    {
-      return filePath.string();
-    }
-  }
-  LOGE("File not found: %s", filename.c_str());
-  LOGI("Search under: ");
-  for(const auto& path : searchPaths)
-  {
-    LOGI("  %s", path.c_str());
-  }
-  return "";
-}
-
-}  // namespace utils
-
-
 //--- MinimalLatest ------------------------------------------------------------------------------------------------------------
 // Main class for the sample
 
@@ -2262,9 +198,9 @@ public:
   {
     // Vulkan Loader
     VK_CHECK(volkInitialize());
-    // Create the GLTF Window
+    // Create the GLFW window
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-#ifdef USE_SLANG
+#if USE_SLANG
     const char* windowTitle = "Minimal Latest (Slang)";
 #else
     const char* windowTitle = "Minimal Latest (GLSL)";
@@ -2284,7 +220,9 @@ public:
     // Main rendering loop
     while(!glfwWindowShouldClose(m_window))
     {
+      // Pacer: this is the frame rate limiter, it will limit the frame rate to the minimum refresh rate of the monitors.
       m_framePacer.paceFrame(m_vSync ? utils::getMonitorsMinRefreshRate() : 10000.0);
+
       glfwPollEvents();
       if(glfwGetWindowAttrib(m_window, GLFW_ICONIFIED) == GLFW_TRUE)
       {
@@ -2325,6 +263,7 @@ public:
         }
         ImGui::EndMainMenuBar();
       }
+      /* END Docking */
 
       // We define "viewport" with no padding an retrieve the rendering area
       ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
@@ -2333,13 +272,14 @@ public:
       ImGui::End();
       ImGui::PopStyleVar();
 
-      // Verify if the viewport has a new size and resize the G-Buffer accordingly.
+      // Verify if the viewport has a new size and resize the RenderTarget accordingly.
       const VkExtent2D viewportSize = {uint32_t(windowSize.x), uint32_t(windowSize.y)};
       if(m_viewportSize.width != viewportSize.width || m_viewportSize.height != viewportSize.height)
       {
         onViewportSizeChange(viewportSize);
       }
 
+      // Extra ImGui windows can be added here, like the demo window.
       // ImGui::ShowDemoWindow();
 
       // Frame Resource Preparation - only render if preparation succeeds
@@ -2350,6 +290,9 @@ public:
 
         // Record rendering commands
         drawFrame(cmd);
+
+        // Ends recording of commands for the frame
+        endCommandRecording(cmd);
 
         // End frame and present
         endFrame(cmd);
@@ -2373,32 +316,85 @@ public:
 private:
   /*--
    * Main initialization sequence
-   * 
-   * 1. Context Creation
-   *    - Creates Vulkan instance with validation layers
-   *    - Selects physical device (prefers discrete GPU)
-   *    - Creates logical device with required extensions
-   * 
-   * 2. Resource Setup
-   *    - Initializes VMA allocator for memory management
-   *    - Creates command pools for graphics commands
-   *    - Sets up swapchain for rendering
-   * 
-   * 3. Pipeline Creation
-   *    - Creates descriptor layouts for textures and buffers
-   *    - Sets up graphics pipeline with vertex/fragment shaders
-   *    - Creates compute pipeline for vertex animation
-   * 
-   * 4. Resource Creation
-   *    - Loads and uploads texture
-   *    - Creates vertex and uniform buffers
-   *    - Sets up ImGui for UI rendering
+   *
+   * 1. Vulkan context
+   *    - Instance with validation layers and debug messenger
+   *    - Physical device (prefers discrete GPU) and logical device
+   *    - Graphics queue; feature chain asserted for every required bool
+   *
+   * 2. Core subsystems
+   *    - VMA allocator (BDA opt-in per buffer)
+   *    - Sampler pool, window surface, transient command pool
+   *    - Swapchain (chooses imageCount and framesInFlight independently)
+   *    - Per-slot frame data sized by framesInFlight, not imageCount
+   *
+   * 3. UI (Dear ImGui)
+   *    - Traditional VkDescriptorPool + internal VkPipeline
+   *    - Independent from this sample's descriptor heap / shader objects
+   *
+   * 4. Rendering path
+   *    - Offscreen RenderTarget (color + depth)
+   *    - Graphics: one VS + two FS shader objects (specialization variants)
+   *    - Compute: traditional VkPipeline (deliberate contrast)
+   *
+   * 5. GPU data
+   *    - Vertex, points, and scene-info buffers (all BDA-accessible)
+   *    - Textures + sampler heap + resource heap (bindless descriptors)
+   *
+   * The "Resource model" comment below this function explains *why*
+   * each resource class uses the binding mechanism it does.
   -*/
   void init()
   {
+    /*-- Resource model -----------------------------------------------------------
+     *
+     * This sample picks a different binding mechanism per resource class. They
+     * coexist freely; understanding which goes where is the key to reading
+     * the rest of this file.
+     *
+     *   Graphics shaders --> Shader objects (VK_EXT_shader_object).
+     *     There is no graphics VkPipeline at all. Three VkShaderEXT objects
+     *     (one vertex + two fragment variants) are created up front; at draw
+     *     time vkCmdBindShadersEXT picks the (vert, frag) pair, and every
+     *     piece of state that used to live in a pipeline (rasterization,
+     *     depth/stencil, blend, vertex input, ...) is set with a vkCmdSet*EXT
+     *     call. See createGraphicsShaders() and setGraphicsDynamicState().
+     *
+     *   Compute shader --> Traditional VkPipeline + VkPipelineLayout.
+     *     Compute *could* also use shader objects (VK_EXT_shader_object supports
+     *     VK_SHADER_STAGE_COMPUTE_BIT), but it is intentionally kept on the
+     *     traditional path so the sample shows both styles side-by-side and
+     *     because compute does not benefit from shader objects' main wins
+     *     (no dynamic state to make dynamic, single-shader pipeline so nothing
+     *     to mix-and-match). See createComputeShaderPipeline() for the full
+     *     rationale.
+     *
+     *   Textures / samplers --> Descriptor heap (VK_EXT_descriptor_heap).
+     *     Sampler and image descriptors live in two GPU buffers (sampler heap
+     *     + resource heap). Shaders index them by integer slot. The graphics
+     *     shader objects carry VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT and no
+     *     descriptor set layouts. See createDescriptorHeap() and
+     *     recordGraphicsCommands().
+     *
+     *   Storage / uniform buffers --> Buffer device address (BDA).
+     *     The shader holds a buffer_reference (a typed GPU pointer) and
+     *     dereferences it directly. No descriptor needed. See m_vertexBuffer,
+     *     m_pointsBuffer, m_sceneInfoBuffer.
+     *
+     *   Small per-draw data --> vkCmdPushDataEXT (graphics) or
+     *                            vkCmdPushConstants2 (compute).
+     *     Graphics has no pipeline layout, so traditional push constants are
+     *     unavailable; vkCmdPushDataEXT writes directly to the shader's
+     *     push_constant block. Compute keeps the legacy path with a real
+     *     VkPushConstantRange in its pipeline layout.
+     *
+     *   ImGui still uses traditional VkDescriptorSet/VkDescriptorPool and its
+     *   own VkPipeline internally (m_uiDescriptorPool); that path is
+     *   independent from the heap and from shader objects.
+     *
+     * -----------------------------------------------------------------------*/
+
     // Vulkan feature structs - allocated on the stack
-    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamicState3Features{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unifiedImageLayoutsFeature{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR};
     // Descriptor heap replaces traditional descriptor sets/pools with GPU buffer-based bindless descriptors.
@@ -2407,35 +403,62 @@ private:
     // Untyped pointers: required by descriptor heap
     VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untypedPtrFeatures{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR};
+    // Shader objects: replace VkPipeline for graphics with linkable, reusable VkShaderEXT
+    // objects bound via vkCmdBindShadersEXT. Pairs naturally with the layout=NULL design:
+    // there is no graphics pipeline object at all, only shader objects + dynamic state.
+    VkPhysicalDeviceShaderObjectFeaturesEXT shaderObjectFeatures{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT};
+    // Extended dynamic state 3: required by shader objects for blend/rasterization
+    // state that no longer lives in a pipeline object.
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamicState3Features{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    // Vertex input dynamic state: required by shader objects (vertex bindings/attributes
+    // become a vkCmdSetVertexInputEXT call instead of pipeline state).
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vertexInputDynamicStateFeatures{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
 
     // Configure Vulkan context with required and optional extensions
     utils::ContextCreateInfo contextConfig;
 
     // Required extensions (with their feature struct pointers)
     contextConfig.deviceExtensions.push_back({VK_KHR_SWAPCHAIN_EXTENSION_NAME, true, nullptr});
-    contextConfig.deviceExtensions.push_back({VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME, false, &unifiedImageLayoutsFeature});  // For VK_IMAGE_LAYOUT_GENERAL usage
-    contextConfig.deviceExtensions.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, true, &dynamicState3Features});
+    contextConfig.deviceExtensions.push_back({VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME, true, &unifiedImageLayoutsFeature});
     contextConfig.deviceExtensions.push_back({VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME, true, &descriptorHeapFeatures});  // Bindless descriptor heap for textures and samplers
     contextConfig.deviceExtensions.push_back({VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME, true, &untypedPtrFeatures});  // Required by bindless
+    contextConfig.deviceExtensions.push_back({VK_EXT_SHADER_OBJECT_EXTENSION_NAME, true, &shaderObjectFeatures});  // Graphics: shader objects instead of pipelines
+    contextConfig.deviceExtensions.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, true, &dynamicState3Features});  // Required for shader-object blend/rasterization state
+    contextConfig.deviceExtensions.push_back({VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, true,
+                                              &vertexInputDynamicStateFeatures});  // Required for shader-object vertex input
 
     // Create the Vulkan context with configuration
     m_context.init(contextConfig);
 
-    // Initialize the VMA allocator
+    // After context.init(), vkGetPhysicalDeviceFeatures2 has populated every
+    // feature struct in the pNext chain. Assert the bools we actually depend
+    // on -- vkCreateDevice will already have failed if a required feature is
+    // missing, but these asserts give a clearer diagnostic on non-conformant
+    // drivers and document the hard dependencies at a glance.
+    ASSERT(unifiedImageLayoutsFeature.unifiedImageLayouts, "unifiedImageLayouts required (GENERAL attachment usage)");
+    ASSERT(descriptorHeapFeatures.descriptorHeap, "descriptorHeap required");
+    ASSERT(untypedPtrFeatures.shaderUntypedPointers, "shaderUntypedPointers required (by descriptorHeap)");
+    ASSERT(shaderObjectFeatures.shaderObject, "shaderObject required (graphics path)");
+    ASSERT(dynamicState3Features.extendedDynamicState3ColorBlendEnable, "extendedDynamicState3 required (shader objects)");
+    ASSERT(vertexInputDynamicStateFeatures.vertexInputDynamicState, "vertexInputDynamicState required (shader objects)");
+
+    // Initialize the VMA allocator. Pass the *device* API version (not the instance loader
+    // version) clamped to the highest version VMA understands in this build (1.4).
     m_allocator.init(VmaAllocatorCreateInfo{
         .physicalDevice   = m_context.getPhysicalDevice(),
         .device           = m_context.getDevice(),
         .instance         = m_context.getInstance(),
-        .vulkanApiVersion = m_context.getApiVersion(),
+        .vulkanApiVersion = std::min(m_context.getDeviceApiVersion(), VK_API_VERSION_1_4),
     });
 
     // Texture sampler pool
     m_samplerPool.init(m_context.getDevice());
 
     // Create the window surface
-    glfwCreateWindowSurface(m_context.getInstance(), m_window, nullptr, static_cast<VkSurfaceKHR*>(&m_surface));
+    VK_CHECK(glfwCreateWindowSurface(m_context.getInstance(), m_window, nullptr, static_cast<VkSurfaceKHR*>(&m_surface)));
     DBG_VK_NAME(m_surface);
-
 
     // Used for creating single-time command buffers
     createTransientCommandPool();
@@ -2445,7 +468,9 @@ private:
     m_windowSize = m_swapchain.initResources(m_vSync);  // Update the window size to the actual size of the surface
 
     // Create what is needed to submit the scene for each frame in-flight
-    createFrameSubmission(m_swapchain.getMaxFramesInFlight());
+    // m_frameData is sized by frames-in-flight (CPU parallelism), NOT by
+    // imageCount (GPU/presentation parallelism).
+    createFrameSubmission(m_swapchain.getFramesInFlight());
 
     // Create a descriptor pool for ImGui (it still needs a traditional pool for its own textures)
     createUIDescriptorPool();
@@ -2453,49 +478,58 @@ private:
     // Initializing Dear ImGui
     initImGui();
 
-    // Acquiring the sampler which will be used for displaying the GBuffer
+    // Acquiring the sampler which will be used for displaying the RenderTarget via ImGui.
+    // Note: this is a separate VkSampler from the one stored in the descriptor heap
+    // (see createDescriptorHeap). They serve independent paths -- ImGui needs a
+    // VkSampler handle for ImGui_ImplVulkan_AddTexture; the heap path only needs a
+    // slot index and stores its sampler descriptor inside the heap buffer.
     const VkSamplerCreateInfo info{.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR};
     const VkSampler linearSampler = m_samplerPool.acquireSampler(info);
     DBG_VK_NAME(linearSampler);
 
-    // Create the GBuffer, the target image and its depth buffer
+    // Create the RenderTarget (offscreen color + depth)
     {
       VkCommandBuffer cmd = utils::beginSingleTimeCommands(m_context.getDevice(), m_transientCmdPool);
 
-      const VkFormat           depthFormat = utils::findDepthFormat(m_context.getPhysicalDevice());
-      utils::GbufferCreateInfo gBufferInit{
+      const VkFormat                depthFormat = utils::findDepthFormat(m_context.getPhysicalDevice());
+      utils::RenderTargetCreateInfo rtInit{
           .device        = m_context.getDevice(),
           .alloc         = &m_allocator,
           .size          = m_windowSize,
-          .color         = {VK_FORMAT_R8G8B8A8_UNORM},  // Only one GBuffer color attachment
+          .color         = {VK_FORMAT_R8G8B8A8_UNORM},  // Single color attachment
           .depth         = depthFormat,
           .linearSampler = linearSampler,
       };
-      m_gBuffer.init(cmd, gBufferInit);
+      m_renderTarget.init(cmd, rtInit);
 
       utils::endSingleTimeCommands(cmd, m_context.getDevice(), m_transientCmdPool, m_context.getGraphicsQueue().queue);
     }
 
-    // With descriptor heap, the graphics pipeline layout is VK_NULL_HANDLE (no descriptor set layouts,
-    // no push constant ranges). All data is passed via vkCmdPushDataEXT and the descriptor heap.
+    // Create graphics shader objects (VK_EXT_shader_object). No graphics pipeline
+    // is built; everything that used to live in a pipeline is now dynamic state.
+    createGraphicsShaders();
 
-    // Create graphics rendering pipeline
-    createGraphicsPipeline();
-
-    // Create the compute shader pipeline and layout
+    // Create the compute shader pipeline and layout (compute keeps the traditional
+    // pipeline path; only graphics is migrated to shader objects in this sample).
     createComputeShaderPipeline();
 
     // Create GPU buffers (SSBO) containing the vertex data and the point data, and the image (uploading data to GPU)
     {
       VkCommandBuffer cmd = utils::beginSingleTimeCommands(m_context.getDevice(), m_transientCmdPool);
-      // Buffer of all vertices
+      // Buffer of all vertices. Used as a vertex buffer by the graphics pipeline,
+      // AND accessed via BDA by the compute shader that animates the first triangle
+      // (see PushConstantCompute::bufferAddress). Hence both VERTEX_BUFFER and
+      // SHADER_DEVICE_ADDRESS usage bits.
       m_vertexBuffer = m_allocator.createBufferAndUploadData(cmd, std::span<const shaderio::Vertex>(s_vertices),
-                                                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                                                             VK_BUFFER_USAGE_2_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT
+                                                                 | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT);
       DBG_VK_NAME(m_vertexBuffer.buffer);
 
-      // Buffer of the points
-      m_pointsBuffer =
-          m_allocator.createBufferAndUploadData(cmd, std::span<const glm::vec2>(s_points), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+      // Buffer of the points. Read by the fragment shader through BDA via
+      // SceneInfo::dataBufferAddress (no descriptor binding).
+      m_pointsBuffer = m_allocator.createBufferAndUploadData(cmd, std::span<const glm::vec2>(s_points),
+                                                             VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT
+                                                                 | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT);
       DBG_VK_NAME(m_pointsBuffer.buffer);
 
       // Load and create the images
@@ -2519,9 +553,9 @@ private:
     // Create a buffer to store the scene information, updated once per frame via vkCmdUpdateBuffer.
     // The shader accesses it through its buffer device address (BDA), not a descriptor set.
     m_sceneInfoBuffer = m_allocator.createBuffer(sizeof(shaderio::SceneInfo),
-                                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                                                     | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                                 VMA_MEMORY_USAGE_GPU_ONLY);
+                                                 VK_BUFFER_USAGE_2_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT
+                                                     | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT,
+                                                 VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
     DBG_VK_NAME(m_sceneInfoBuffer.buffer);
   }
 
@@ -2541,10 +575,10 @@ private:
     ImGui::DestroyContext();
 
     vkDestroyPipeline(device, m_computePipeline, nullptr);
-    vkDestroyPipeline(device, m_graphicsPipelineWithTexture, nullptr);
-    vkDestroyPipeline(device, m_graphicsPipelineWithoutTexture, nullptr);
-    // No graphics pipeline layout to destroy (VK_NULL_HANDLE with descriptor heap)
     vkDestroyPipelineLayout(device, m_computePipelineLayout, nullptr);
+    vkDestroyShaderEXT(device, m_vertShader, nullptr);
+    vkDestroyShaderEXT(device, m_fragShaderTextured, nullptr);
+    vkDestroyShaderEXT(device, m_fragShaderNoTexture, nullptr);
     vkDestroyCommandPool(device, m_transientCmdPool, nullptr);
     vkDestroySurfaceKHR(m_context.getInstance(), m_surface, nullptr);
     vkDestroyDescriptorPool(device, m_uiDescriptorPool, nullptr);  // ImGui descriptor pool
@@ -2562,27 +596,25 @@ private:
     m_allocator.destroyBuffer(m_sceneInfoBuffer);     // Scene info GPU buffer (accessed via BDA)
     m_allocator.destroyBuffer(m_samplerHeapBuffer);   // Descriptor heap: sampler GPU buffer
     m_allocator.destroyBuffer(m_resourceHeapBuffer);  // Descriptor heap: resource (image) GPU buffer
-    m_allocator.destroyImageResource(m_image[0]);
-    m_allocator.destroyImageResource(m_image[1]);
+    for(auto& img : m_image)
+    {
+      m_allocator.destroyImageResource(img);
+    }
 
-    m_gBuffer.deinit();
+    m_renderTarget.deinit();
     m_allocator.deinit();
     m_context.deinit();
   }
 
   /*--
-   * Create a command pool for short lived operations
-   * The command pool is used to allocate command buffers.
-   * In the case of this sample, we only need one command buffer, for temporary execution.
+   * Create a command pool for short lived operations (one-off uploads, image
+   * layout transitions, ...). TRANSIENT_BIT hints the driver that command
+   * buffers from this pool are short-lived.
   -*/
   void createTransientCommandPool()
   {
-    const VkCommandPoolCreateInfo commandPoolCreateInfo{
-        .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,  // Hint that commands will be short-lived
-        .queueFamilyIndex = m_context.getGraphicsQueue().familyIndex,
-    };
-    VK_CHECK(vkCreateCommandPool(m_context.getDevice(), &commandPoolCreateInfo, nullptr, &m_transientCmdPool));
+    m_transientCmdPool = utils::createCommandPool(m_context.getDevice(), m_context.getGraphicsQueue().familyIndex,
+                                                  VK_COMMAND_POOL_CREATE_TRANSIENT_BIT);
     DBG_VK_NAME(m_transientCmdPool);
   }
 
@@ -2597,9 +629,7 @@ private:
 
     m_frameData.resize(numFrames);
 
-    /*-- 
-     * Initialize timeline semaphore at 0. We'll use a monotonic counter (m_frameCounter) starting at 1.
-    -*/
+    // Initialize timeline semaphore at 0. We'll use a monotonic counter (m_frameCounter) starting at 1.
     const uint64_t initialValue = 0;
 
     VkSemaphoreTypeCreateInfo timelineCreateInfo = {
@@ -2621,17 +651,14 @@ private:
      * Create command pools and buffers for each frame
      * Each frame gets its own command pool to allow parallel command recording while previous frames may still be executing on the GPU
     -*/
-    const VkCommandPoolCreateInfo cmdPoolCreateInfo{
-        .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .queueFamilyIndex = m_context.getGraphicsQueue().familyIndex,
-    };
+    const uint32_t queueFamily = m_context.getGraphicsQueue().familyIndex;
 
     for(uint32_t i = 0; i < numFrames; i++)
     {
       m_frameData[i].lastSignalValue = initialValue;  // Initialize to timeline semaphore's initial value
 
       // Separate pools allow independent reset/recording of commands while other frames are still in-flight
-      VK_CHECK(vkCreateCommandPool(device, &cmdPoolCreateInfo, nullptr, &m_frameData[i].cmdPool));
+      m_frameData[i].cmdPool = utils::createCommandPool(device, queueFamily);
       DBG_VK_NAME(m_frameData[i].cmdPool);
 
       const VkCommandBufferAllocateInfo commandBufferAllocateInfo = {
@@ -2678,7 +705,7 @@ private:
     /*-- The ImGui code -*/
 
     /*-- 
-     * The rendering of the scene is done using dynamic rendering with a G-Buffer (see recordGraphicCommands).
+     * The rendering of the scene is done using dynamic rendering into the RenderTarget (see recordGraphicsCommands).
      * The target image will be rendered/displayed using ImGui.
      * Its placement will cover the entire viewport (ImGui draws a quad with the texture we provide),
      * and the image will be displayed in the viewport.
@@ -2692,8 +719,8 @@ private:
     // Using the dock "Viewport", this sets the window to cover the entire central viewport
     if(ImGui::Begin("Viewport"))
     {
-      // !!! This is where the GBuffer image is displayed !!!
-      ImGui::Image(m_gBuffer.getImTextureID(0), ImGui::GetContentRegionAvail());
+      // !!! This is where the RenderTarget image is displayed !!!
+      ImGui::Image(m_renderTarget.getImTextureID(0), ImGui::GetContentRegionAvail());
 
       // Adding overlay text on the upper left corner
       ImGui::SetCursorPos(ImVec2(0, 0));
@@ -2716,15 +743,30 @@ private:
 
     /*--
      * - A compute shader is modifying the vertex position
-     * - Draw commands for the triangles are recorded to the command buffer, with target image in the G-Buffer
+     * - Draw commands for the triangles are recorded to the command buffer, with target image in the RenderTarget
     -*/
     recordComputeCommands(cmd);
-    recordGraphicCommands(cmd);  // Record the rendering commands for the triangles
+    recordGraphicsCommands(cmd);  // Record the rendering commands for the triangles
+
+    // Make the RenderTarget color writes visible to ImGui's fragment shader read.
+    const VkMemoryBarrier2 rtToImGui{
+        .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+    };
+    const VkDependencyInfo rtToImGuiDep{
+        .sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers    = &rtToImGui,
+    };
+    vkCmdPipelineBarrier2(cmd, &rtToImGuiDep);
 
     // Start rendering to the swapchain
     beginDynamicRenderingToSwapchain(cmd);
     {
-      // The ImGui draw commands are recorded to the command buffer, which includes the display of our GBuffer image
+      // The ImGui draw commands are recorded to the command buffer, which includes the display of our RenderTarget image
       ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
     }
     endDynamicRenderingToSwapchain(cmd);
@@ -2739,9 +781,6 @@ private:
   -*/
   void endFrame(VkCommandBuffer cmd)
   {
-    // Ends recording of commands for the frame
-    VK_CHECK(vkEndCommandBuffer(cmd));
-
     /*-- 
      * Prepare to submit the current frame for rendering 
      * First add the swapchain semaphore to wait for the image to be available.
@@ -2750,17 +789,19 @@ private:
     std::vector<VkSemaphoreSubmitInfo> signalSemaphores;
     waitSemaphores.push_back({
         .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = m_swapchain.getImageAvailableSemaphore(),
+        .semaphore = m_swapchain.getAcquireSemaphore(),
         .stageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
     });
     signalSemaphores.push_back({
         .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = m_swapchain.getRenderFinishedSemaphore(),
+        .semaphore = m_swapchain.getPresentSemaphore(),
         .stageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
     });
 
-    // Get the frame data for the current frame in the ring buffer
-    auto& frame = m_frameData[m_frameRingCurrent];
+    // Get the frame data for the current in-flight slot. The Swapchain owns the
+    // frame-resource index; we use it here so both stay in lockstep by construction.
+    const uint32_t frameSlot = m_swapchain.getFrameResourceIndex();
+    auto&          frame     = m_frameData[frameSlot];
 
     /*--
      * Calculate the signal value for when this frame completes
@@ -2769,7 +810,7 @@ private:
     const uint64_t signalFrameValue = m_frameCounter++;
     frame.lastSignalValue           = signalFrameValue;  // Store for next time this frame buffer is used
 #ifdef NVVK_SEMAPHORE_DEBUG
-    LOGI("SubmitFrame: \t\t ring=%u signalValue=%llu", m_frameRingCurrent, static_cast<unsigned long long>(signalFrameValue));
+    LOGI("SubmitFrame: \t\t slot=%u signalValue=%llu", frameSlot, static_cast<unsigned long long>(signalFrameValue));
 #endif
 
     /*-- 
@@ -2803,11 +844,10 @@ private:
     // Submit the command buffer to the GPU and signal when it's done
     VK_CHECK(vkQueueSubmit2(m_context.getGraphicsQueue().queue, uint32_t(submitInfo.size()), submitInfo.data(), nullptr));
 
-    // Present the image
+    // Present the image. presentFrame() advances the swapchain's frame-resource
+    // index for us, so the next call to prepareFrameResources() will pick up
+    // the next slot.
     m_swapchain.presentFrame(m_context.getGraphicsQueue().queue);
-
-    // Move to the next frame
-    m_frameRingCurrent = (m_frameRingCurrent + 1) % m_swapchain.getMaxFramesInFlight();
   }
 
 
@@ -2818,24 +858,26 @@ private:
   void onViewportSizeChange(VkExtent2D size)
   {
     m_viewportSize = size;
-    // Recreate the G-Buffer to the size of the viewport
+    // Recreate the RenderTarget to the size of the viewport
     vkQueueWaitIdle(m_context.getGraphicsQueue().queue);
 
     {
       VkCommandBuffer cmd = utils::beginSingleTimeCommands(m_context.getDevice(), m_transientCmdPool);
-      m_gBuffer.update(cmd, m_viewportSize);
+      m_renderTarget.update(cmd, m_viewportSize);
       utils::endSingleTimeCommands(cmd, m_context.getDevice(), m_transientCmdPool, m_context.getGraphicsQueue().queue);
     }
   }
 
   /*--
    * We are using dynamic rendering, which is a more flexible way to render to the swapchain image.
+   * Only ImGui is rendered to the swapchain image.
+   * The scene is rendered to the RenderTarget, and the rendered image is displayed using ImGui.
   -*/
   void beginDynamicRenderingToSwapchain(VkCommandBuffer cmd) const
   {
     // Image to render to
     const std::array<VkRenderingAttachmentInfo, 1> colorAttachment{{{
-        .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR,
+        .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView   = m_swapchain.getImageView(),
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,   // Clear the image (see clearValue)
@@ -2939,14 +981,15 @@ private:
   /*--
    * Recording the commands to render the scene
   -*/
-  void recordGraphicCommands(VkCommandBuffer cmd)
+  void recordGraphicsCommands(VkCommandBuffer cmd)
   {
-    DBG_VK_SCOPE(cmd);  // <-- Helps to debug in NSight
+    DBG_VK_SCOPE(cmd);  // <-- Helps to debug in Nsight
 
     // Update the scene buffer once per frame (cannot be done inside dynamic rendering)
     updateSceneBuffer(cmd);
 
     const VkDeviceSize offsets[] = {0};
+    const VkDeviceSize sizes[]   = {VK_WHOLE_SIZE};
     const VkViewport   viewport{0.0F, 0.0F, float(m_viewportSize.width), float(m_viewportSize.height), 0.0F, 1.0F};
     const VkRect2D     scissor{{0, 0}, m_viewportSize};
 
@@ -2971,7 +1014,7 @@ private:
     // Image to render to
     const std::array<VkRenderingAttachmentInfo, 1> colorAttachment{{{
         .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView   = m_gBuffer.getColorImageView(),
+        .imageView   = m_renderTarget.getColorImageView(),
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,   // Clear the image (see clearValue)
         .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,  // Store the image (keep the image)
@@ -2981,7 +1024,7 @@ private:
     // Depth buffer to use
     const VkRenderingAttachmentInfo depthAttachment{
         .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView   = m_gBuffer.getDepthImageView(),
+        .imageView   = m_renderTarget.getDepthImageView(),
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,   // Clear depth buffer
         .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,  // Store depth buffer
@@ -2991,7 +1034,7 @@ private:
     // Details of the dynamic rendering
     const VkRenderingInfo renderingInfo{
         .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea           = {{0, 0}, m_gBuffer.getSize()},
+        .renderArea           = {{0, 0}, m_renderTarget.getSize()},
         .layerCount           = 1,
         .colorAttachmentCount = uint32_t(colorAttachment.size()),
         .pColorAttachments    = colorAttachment.data(),
@@ -3001,9 +1044,12 @@ private:
     // Begin dynamic rendering
     vkCmdBeginRendering(cmd, &renderingInfo);
 
-    // **Dynamic**  Defining the size of the viewport and the scissor
-    vkCmdSetViewportWithCount(cmd, 1, &viewport);
-    vkCmdSetScissorWithCount(cmd, 1, &scissor);
+    // ---- Dynamic state ----------------------------------------------------
+    // With shader objects, every piece of state that used to live in the
+    // graphics pipeline must be set explicitly with a vkCmdSet*EXT call before
+    // each draw. We set everything once here since none of it changes between
+    // the two draws below.
+    setGraphicsDynamicState(cmd, viewport, scissor);
 
     // Bind the descriptor heap buffers so shaders can access textures and samplers by index.
     // This replaces the traditional vkCmdBindDescriptorSets2 call that was used for the texture descriptor set.
@@ -3025,246 +1071,227 @@ private:
     };
     vkCmdBindResourceHeapEXT(cmd, &resourceHeapBind);
 
-    // Binding the Buffer containing all our Vertex
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, offsets);
+    // Bind the vertex buffer. vkCmdBindVertexBuffers2 (Vulkan 1.3 core) extends the
+    // older vkCmdBindVertexBuffers with optional pSizes and pStrides arrays. With
+    // shader objects, vertex input layout is dynamic (set via vkCmdSetVertexInputEXT
+    // above), so passing explicit sizes/strides here is fine.
+    vkCmdBindVertexBuffers2(cmd, 0, 1, &m_vertexBuffer.buffer, offsets, sizes, nullptr);
+
+    // Bind shader objects: vertex stage (shared) + the no-texture fragment stage.
+    utils::cmdBindGraphicsShaders(cmd, m_vertShader, m_fragShaderNoTexture);
 
     // Push data for the first triangle (red, no texture)
     pushData.color = glm::vec3(1, 0, 0);
-    vkCmdPushDataEXT(cmd, &pushDataInfo);  // Send all push data to the shader
-
-    // Draw the first triangle without texture (pipeline with specialization constant set to false)
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipelineWithoutTexture);
+    vkCmdPushDataEXT(cmd, &pushDataInfo);
     vkCmdDraw(cmd, 3, 1, 0, 0);  // 3 vertices, 1 instance, 0 offset
+
+    // Swap to the textured fragment shader; vertex stage stays bound.
+    utils::cmdBindGraphicsShaders(cmd, m_vertShader, m_fragShaderTextured);
 
     // Push data again with different color for the second triangle (green, with texture)
     pushData.color = glm::vec3(0, 1, 0);
-    vkCmdPushDataEXT(cmd, &pushDataInfo);  // Re-send with updated color
-
-    // Draw the second triangle with texture
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipelineWithTexture);
+    vkCmdPushDataEXT(cmd, &pushDataInfo);
     vkCmdDraw(cmd, 3, 1, 3, 0);  // 3 vertices, 1 instance, 3 offset (second triangle)
 
     vkCmdEndRendering(cmd);
   }
 
   /*--
-   * The graphic pipeline is all the stages that are used to render a section of the scene.
-   * Stages like: vertex shader, fragment shader, rasterization, and blending.
-   * 
-   * This implementation uses VkPipelineCreateFlags2CreateInfoKHR (Maintenance5/Vulkan 1.4).
-   * 
-   * See other available flags for advanced use cases: 
-   * - VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR: Create pipeline libraries for fast linking
-   * - VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT: Enable descriptor buffers
-   * - VK_PIPELINE_CREATE_2_CAPTURE_STATISTICS_BIT_KHR: Capture shader statistics
-   * - VK_PIPELINE_CREATE_2_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT: Optimize linking
+   * Set every dynamic state required by shader objects before a draw.
+   *
+   * Without a graphics pipeline object, all of viewport/scissor, rasterization,
+   * depth/stencil, blend, multisample, vertex input, and primitive topology are
+   * dynamic. The list below covers what this sample uses; tessellation, mesh
+   * shading, transform feedback, conservative rasterization, etc. would each
+   * add their own vkCmdSet*EXT calls (and the matching device features).
   -*/
-  void createGraphicsPipeline()
+  void setGraphicsDynamicState(VkCommandBuffer cmd, const VkViewport& viewport, const VkRect2D& scissor) const
   {
-    // Spir-V to shader modules
-#ifdef USE_SLANG
-    const char* vertEntryName = "vertexMain";
-    const char* fragEntryName = "fragmentMain";
+    // Viewport / scissor (counts and values are both dynamic).
+    vkCmdSetViewportWithCount(cmd, 1, &viewport);
+    vkCmdSetScissorWithCount(cmd, 1, &scissor);
 
-    VkShaderModule vertShaderModule =
-        utils::createShaderModule(m_context.getDevice(), {shader_rast_slang, std::size(shader_rast_slang)});
-    DBG_VK_NAME(vertShaderModule);
-    VkShaderModule fragShaderModule = vertShaderModule;
-#else
-    const char* vertEntryName = "main";
-    const char* fragEntryName = "main";
-
-    VkShaderModule vertShaderModule =
-        utils::createShaderModule(m_context.getDevice(), {shader_vert_glsl, std::size(shader_vert_glsl)});
-    DBG_VK_NAME(vertShaderModule);
-    VkShaderModule fragShaderModule =
-        utils::createShaderModule(m_context.getDevice(), {shader_frag_glsl, std::size(shader_frag_glsl)});
-    DBG_VK_NAME(fragShaderModule);
-#endif
-
-    VkBool32 useTexture = VK_TRUE;  // Change to VK_FALSE for the pipeline that does not use textures
-
-    /*--  
-     * Define specialization constants for the fragment shader
-     * Not required, but used in this sample, as it's a good example of how to use specialization constants.
-    -*/
-    const VkSpecializationMapEntry specializationMapEntry = {.constantID = 0, .offset = 0, .size = sizeof(VkBool32)};
-    const VkSpecializationInfo     specializationInfo     = {
-                .mapEntryCount = 1,
-                .pMapEntries   = &specializationMapEntry,
-                .dataSize      = sizeof(useTexture),
-                .pData         = &useTexture,
+    // Vertex input: bindings (stride, input rate) and attributes (location, format, offset).
+    // VK_EXT_vertex_input_dynamic_state replaces VkPipelineVertexInputStateCreateInfo.
+    const VkVertexInputBindingDescription2EXT vertexBinding{
+        .sType     = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+        .binding   = 0,
+        .stride    = sizeof(Vertex),
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+        .divisor   = 1,
     };
-
-    // The stages used by this pipeline
-    const std::array<VkPipelineShaderStageCreateInfo, 2> shaderStages = {{
-        {// Vertex shader
-         .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage  = VK_SHADER_STAGE_VERTEX_BIT,
-         .module = vertShaderModule,
-         .pName  = vertEntryName},
-        {// Fragment shader
-         .sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage               = VK_SHADER_STAGE_FRAGMENT_BIT,
-         .module              = fragShaderModule,
-         .pName               = fragEntryName,
-         .pSpecializationInfo = &specializationInfo},
+    const std::array<VkVertexInputAttributeDescription2EXT, 3> vertexAttributes = {{
+        {.sType    = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+         .location = shaderio::LVPosition,
+         .binding  = 0,
+         .format   = VK_FORMAT_R32G32B32_SFLOAT,
+         .offset   = uint32_t(offsetof(Vertex, position))},
+        {.sType    = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+         .location = shaderio::LVColor,
+         .binding  = 0,
+         .format   = VK_FORMAT_R32G32B32_SFLOAT,
+         .offset   = uint32_t(offsetof(Vertex, color))},
+        {.sType    = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+         .location = shaderio::LVTexCoord,
+         .binding  = 0,
+         .format   = VK_FORMAT_R32G32_SFLOAT,
+         .offset   = uint32_t(offsetof(Vertex, texCoord))},
     }};
+    vkCmdSetVertexInputEXT(cmd, 1, &vertexBinding, uint32_t(vertexAttributes.size()), vertexAttributes.data());
 
-    // Describe the layout of the Vertex in the Buffer, which is passed to the vertex shader
-    const auto&                                bindingDescription    = Vertex::getBindingDescription();
-    const auto&                                attributeDescriptions = Vertex::getAttributeDescriptions();
-    const VkPipelineVertexInputStateCreateInfo vertexInputInfo       = {
-              .sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-              .vertexBindingDescriptionCount   = uint32_t(bindingDescription.size()),
-              .pVertexBindingDescriptions      = bindingDescription.data(),
-              .vertexAttributeDescriptionCount = uint32_t(attributeDescriptions.size()),
-              .pVertexAttributeDescriptions    = attributeDescriptions.data(),
-    };
+    // Input assembly.
+    vkCmdSetPrimitiveTopology(cmd, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+    vkCmdSetPrimitiveRestartEnable(cmd, VK_FALSE);
 
-    // The input assembly is used to describe how the vertices are assembled into primitives (triangles)
-    const VkPipelineInputAssemblyStateCreateInfo inputAssemblyInfo = {
-        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology               = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-        .primitiveRestartEnable = VK_FALSE,
-    };
+    // Rasterization (most of these come from VK_EXT_extended_dynamic_state_3).
+    vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
+    vkCmdSetPolygonModeEXT(cmd, VK_POLYGON_MODE_FILL);
+    vkCmdSetCullMode(cmd, VK_CULL_MODE_NONE);
+    vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    vkCmdSetDepthBiasEnable(cmd, VK_FALSE);
+    vkCmdSetDepthClampEnableEXT(cmd, VK_FALSE);
 
-    /*--
-     * The dynamic state is used to change the viewport and the scissor dynamically.
-     * If we don't do this, we need to recreate the pipeline when the window is resized.
-     * NOTE: more dynamic states can be added, but performance 'can' be impacted.
-    -*/
-    const std::array<VkDynamicState, 2> dynamicStates = {
-        VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
-        VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
-    };
+    // Multisampling.
+    vkCmdSetRasterizationSamplesEXT(cmd, VK_SAMPLE_COUNT_1_BIT);
+    const VkSampleMask sampleMask = 0xFFFFFFFF;
+    vkCmdSetSampleMaskEXT(cmd, VK_SAMPLE_COUNT_1_BIT, &sampleMask);
+    vkCmdSetAlphaToCoverageEnableEXT(cmd, VK_FALSE);
+    // alphaToOne is required by the spec when its device feature is enabled and a
+    // shader object is bound, even if we don't actually use it.
+    vkCmdSetAlphaToOneEnableEXT(cmd, VK_FALSE);
 
-    const VkPipelineDynamicStateCreateInfo dynamicStateInfo{
-        .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = uint32_t(dynamicStates.size()),
-        .pDynamicStates    = dynamicStates.data(),
-    };
+    // Depth / stencil.
+    vkCmdSetDepthTestEnable(cmd, VK_TRUE);
+    vkCmdSetDepthWriteEnable(cmd, VK_TRUE);
+    vkCmdSetDepthCompareOp(cmd, VK_COMPARE_OP_LESS_OR_EQUAL);
+    vkCmdSetDepthBoundsTestEnable(cmd, VK_FALSE);
+    vkCmdSetStencilTestEnable(cmd, VK_FALSE);
 
-    // The rasterizer is used to convert the primitives into fragments, and how it will appear
-    const VkPipelineRasterizationStateCreateInfo rasterizerInfo = {
-        .sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode    = VK_CULL_MODE_NONE,  // No culling
-        .frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .lineWidth   = 1.0f,
-    };
-
-    // No multi-sampling
-    const VkPipelineMultisampleStateCreateInfo multisamplingInfo = {
-        .sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-    };
-
-    /*--
-     * The color blending is used to blend the color of the fragment with the color already in the framebuffer (all channel)
-     * Here we enable blending, such that the alpha channel is used to blend the color with the color already in the framebuffer.
-     * The texture will have part transparent.
-     *
-     * Without blending, everything can be set to 0, except colorWriteMask, which needs to be set.
-    -*/
-    const VkPipelineColorBlendAttachmentState colorBlendAttachment = {
-        .blendEnable         = VK_TRUE,
+    // Color blend (for one color attachment). Match the previous pipeline's
+    // alpha-blend setup; nothing varies between draws so we set it once.
+    const VkBool32                blendEnable = VK_TRUE;
+    const VkColorBlendEquationEXT blendEquation{
         .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .colorBlendOp        = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
         .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .alphaBlendOp        = VK_BLEND_OP_ADD,
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
     };
+    const VkColorComponentFlags colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    vkCmdSetColorBlendEnableEXT(cmd, 0, 1, &blendEnable);
+    vkCmdSetColorBlendEquationEXT(cmd, 0, 1, &blendEquation);
+    vkCmdSetColorWriteMaskEXT(cmd, 0, 1, &colorWriteMask);
+    vkCmdSetLogicOpEnableEXT(cmd, VK_FALSE);
+  }
 
-    const VkPipelineColorBlendStateCreateInfo colorBlendingInfo = {
-        .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .logicOpEnable   = VK_FALSE,          // No logic operation
-        .logicOp         = VK_LOGIC_OP_COPY,  // Don't care
-        .attachmentCount = 1,
-        .pAttachments    = &colorBlendAttachment,
-    };
+  /*--
+   * Create the graphics shader objects (VK_EXT_shader_object).
+   *
+   * Shader objects replace VkPipeline for graphics in this sample. Three benefits:
+   *   1. No pipeline state object: every state that used to live in a pipeline
+   *      (vertex input, rasterization, depth/stencil, blend, ...) is now set
+   *      dynamically before each draw via vkCmdSet*EXT.
+   *   2. Pairs naturally with the layout = VK_NULL_HANDLE / descriptor-heap design:
+   *      both eliminate "object that bakes state ahead of time" concerns.
+   *   3. Mix-and-match at draw time: one VkShaderEXT per stage, swap freely.
+   *
+   * We create three unlinked shader objects:
+   *   - vertex shader (shared)
+   *   - fragment shader with useTexture=true
+   *   - fragment shader with useTexture=false
+   * "Unlinked" means each is independent; we bind the right (VS, FS) pair per draw.
+   * For better cross-stage optimization, an alternative is to create *linked* sets
+   * with VK_SHADER_CREATE_LINK_STAGE_BIT_EXT in a single vkCreateShadersEXT call.
+   *
+   * VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT is the shader-object equivalent of the
+   * descriptor-heap pipeline flag we used before; setLayoutCount and pPushConstantRanges
+   * stay zero/null for the same reason the pipeline layout was VK_NULL_HANDLE.
+  -*/
+  void createGraphicsShaders()
+  {
+#if USE_SLANG
+    const char*                     vertEntryName = "vertexMain";
+    const char*                     fragEntryName = "fragmentMain";
+    const std::span<const uint32_t> vertCode{shader_rast_slang, std::size(shader_rast_slang)};
+    const std::span<const uint32_t> fragCode{shader_rast_slang, std::size(shader_rast_slang)};  // Same module, different entry
+#else
+    const char*                     vertEntryName = "main";
+    const char*                     fragEntryName = "main";
+    const std::span<const uint32_t> vertCode{shader_vert_glsl, std::size(shader_vert_glsl)};
+    const std::span<const uint32_t> fragCode{shader_frag_glsl, std::size(shader_frag_glsl)};
+#endif
 
-    // With descriptor heap + push data, the graphics pipeline layout is VK_NULL_HANDLE.
-    // The spec requires layout = VK_NULL_HANDLE when VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT is set.
-    // All shader data is provided via vkCmdPushDataEXT (push data) and descriptor heap bindings.
-
-    // Dynamic rendering: provide what the pipeline will render to
-    const std::array<VkFormat, 1>       imageFormats = {{
-        {m_gBuffer.getColorFormat()},  // This pipeline only output to this color attachment (G-Buffer)
-    }};
-    const VkPipelineRenderingCreateInfo dynamicRenderingInfo{
-        .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-        .colorAttachmentCount    = uint32_t(imageFormats.size()),
-        .pColorAttachmentFormats = imageFormats.data(),
-        .depthAttachmentFormat   = m_gBuffer.getDepthFormat(),
-    };
-
-    // Instruct how the depth buffer will be used
-    const VkPipelineDepthStencilStateCreateInfo depthStateInfo = {
-        .sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .depthTestEnable  = VK_TRUE,
-        .depthWriteEnable = VK_TRUE,
-        .depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL,
-    };
-
-    // Tell the pipeline that shaders will access descriptors via the descriptor heap.
-    // This flag is required when using VK_EXT_descriptor_heap with traditional pipelines
-    // (equivalent to VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT for shader objects).
-    const VkPipelineCreateFlags2CreateInfoKHR pipelineFlags2{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
-        .pNext = &dynamicRenderingInfo,
-        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT,
-    };
-
-    // The pipeline is created with all the information
-    const VkGraphicsPipelineCreateInfo pipelineInfo = {
-        .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext               = &pipelineFlags2,  // Chains: flags2 -> dynamicRendering
-        .stageCount          = uint32_t(shaderStages.size()),
-        .pStages             = shaderStages.data(),
-        .pVertexInputState   = &vertexInputInfo,
-        .pInputAssemblyState = &inputAssemblyInfo,
-        //.pViewportState      = DYNAMIC see above,
-        .pRasterizationState = &rasterizerInfo,
-        .pMultisampleState   = &multisamplingInfo,
-        .pDepthStencilState  = &depthStateInfo,
-        .pColorBlendState    = &colorBlendingInfo,
-        .pDynamicState       = &dynamicStateInfo,
-        .layout              = VK_NULL_HANDLE,  // Required by VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT
-    };
-    VK_CHECK(vkCreateGraphicsPipelines(m_context.getDevice(), nullptr, 1, &pipelineInfo, nullptr, &m_graphicsPipelineWithTexture));
-    DBG_VK_NAME(m_graphicsPipelineWithTexture);
-
-    /*-- 
-     * Create pipeline without texture (same descriptor heap flag applies)
+    /*--
+     * Specialization constants. Two distinct VkSpecializationInfo instances, each
+     * pointing at its own immutable VkBool32 -- the same pattern we used with
+     * pipelines, equally valid for shader objects.
     -*/
-    useTexture = VK_FALSE;  // This works because we used the address of useTexture in specializationInfo, so changing the value here changes the specialization constant for the second pipeline (shaderStage)
-
-    const VkGraphicsPipelineCreateInfo pipelineInfoNoTexture = {
-        .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext               = &pipelineFlags2,  // Same flags2 chain as above
-        .stageCount          = uint32_t(shaderStages.size()),
-        .pStages             = shaderStages.data(),
-        .pVertexInputState   = &vertexInputInfo,
-        .pInputAssemblyState = &inputAssemblyInfo,
-        .pRasterizationState = &rasterizerInfo,
-        .pMultisampleState   = &multisamplingInfo,
-        .pDepthStencilState  = &depthStateInfo,
-        .pColorBlendState    = &colorBlendingInfo,
-        .pDynamicState       = &dynamicStateInfo,
-        .layout              = VK_NULL_HANDLE,  // Required by VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT
+    static constexpr VkBool32      kUseTextureTrue  = VK_TRUE;
+    static constexpr VkBool32      kUseTextureFalse = VK_FALSE;
+    const VkSpecializationMapEntry specMapEntry     = {.constantID = 0, .offset = 0, .size = sizeof(VkBool32)};
+    const VkSpecializationInfo     specInfoTextured = {
+            .mapEntryCount = 1,
+            .pMapEntries   = &specMapEntry,
+            .dataSize      = sizeof(VkBool32),
+            .pData         = &kUseTextureTrue,
     };
-    VK_CHECK(vkCreateGraphicsPipelines(m_context.getDevice(), nullptr, 1, &pipelineInfoNoTexture, nullptr,
-                                       &m_graphicsPipelineWithoutTexture));
-    DBG_VK_NAME(m_graphicsPipelineWithoutTexture);
+    const VkSpecializationInfo specInfoNoTexture = {
+        .mapEntryCount = 1,
+        .pMapEntries   = &specMapEntry,
+        .dataSize      = sizeof(VkBool32),
+        .pData         = &kUseTextureFalse,
+    };
 
-    // Clean up the shader modules
-    vkDestroyShaderModule(m_context.getDevice(), vertShaderModule, nullptr);
-#ifndef USE_SLANG
-    vkDestroyShaderModule(m_context.getDevice(), fragShaderModule, nullptr);
-#endif  // USE_SLANG
+    // Three unlinked shader objects. nextStage is a hint to the driver about
+    // which stage will follow at bind time -- it doesn't constrain what we
+    // can actually bind.
+    const VkShaderCreateFlagsEXT commonFlags = VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT;
+
+    const VkShaderCreateInfoEXT vertCreateInfo{
+        .sType                  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
+        .flags                  = commonFlags,
+        .stage                  = VK_SHADER_STAGE_VERTEX_BIT,
+        .nextStage              = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .codeType               = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+        .codeSize               = vertCode.size() * sizeof(uint32_t),
+        .pCode                  = vertCode.data(),
+        .pName                  = vertEntryName,
+        .setLayoutCount         = 0,  // Descriptor heap: no descriptor set layouts
+        .pSetLayouts            = nullptr,
+        .pushConstantRangeCount = 0,  // Push data (vkCmdPushDataEXT) is used instead
+        .pPushConstantRanges    = nullptr,
+        .pSpecializationInfo    = nullptr,  // Vertex shader has no spec constants
+    };
+
+    VkShaderCreateInfoEXT fragCreateInfoTextured{
+        .sType                  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
+        .flags                  = commonFlags,
+        .stage                  = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .nextStage              = 0,  // Last stage in the pipeline
+        .codeType               = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+        .codeSize               = fragCode.size() * sizeof(uint32_t),
+        .pCode                  = fragCode.data(),
+        .pName                  = fragEntryName,
+        .setLayoutCount         = 0,
+        .pSetLayouts            = nullptr,
+        .pushConstantRangeCount = 0,
+        .pPushConstantRanges    = nullptr,
+        .pSpecializationInfo    = &specInfoTextured,
+    };
+
+    VkShaderCreateInfoEXT fragCreateInfoNoTexture = fragCreateInfoTextured;
+    fragCreateInfoNoTexture.pSpecializationInfo   = &specInfoNoTexture;
+
+    // Create all three in separate calls. Each creates an unlinked shader object
+    // that can be bound independently.
+    VK_CHECK(vkCreateShadersEXT(m_context.getDevice(), 1, &vertCreateInfo, nullptr, &m_vertShader));
+    DBG_VK_NAME(m_vertShader);
+    VK_CHECK(vkCreateShadersEXT(m_context.getDevice(), 1, &fragCreateInfoTextured, nullptr, &m_fragShaderTextured));
+    DBG_VK_NAME(m_fragShaderTextured);
+    VK_CHECK(vkCreateShadersEXT(m_context.getDevice(), 1, &fragCreateInfoNoTexture, nullptr, &m_fragShaderNoTexture));
+    DBG_VK_NAME(m_fragShaderNoTexture);
   }
 
   /*-- Initialize ImGui -*/
@@ -3284,7 +1311,7 @@ private:
               .Queue          = m_context.getGraphicsQueue().queue,
               .DescriptorPool = m_uiDescriptorPool,
               .MinImageCount  = 2,
-              .ImageCount     = m_swapchain.getMaxFramesInFlight(),
+              .ImageCount     = m_swapchain.getImageCount(),
               .PipelineInfoMain =
             {
                       .PipelineRenderingCreateInfo =  // Dynamic rendering
@@ -3335,8 +1362,8 @@ private:
 
     // All heap buffers need these usage flags: device address for binding, transfer dst for upload,
     // and the descriptor heap bit to mark them as heap storage
-    VkBufferUsageFlags2KHR heapUsage = VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT_KHR
-                                       | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR | VK_BUFFER_USAGE_2_DESCRIPTOR_HEAP_BIT_EXT;
+    VkBufferUsageFlags2 heapUsage = VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT
+                                    | VK_BUFFER_USAGE_2_DESCRIPTOR_HEAP_BIT_EXT;
 
     // ---- Sampler Heap ----
     // We only need one sampler in this sample (linear filtering), but the heap can hold more
@@ -3370,6 +1397,7 @@ private:
     // Create the GPU buffer for the sampler heap and upload the staging data
     m_samplerHeapBuffer =
         m_allocator.createBufferAndUploadData(cmd, std::span(samplerHeapData), heapUsage, {}, heapProps.samplerHeapAlignment);
+    DBG_VK_NAME(m_samplerHeapBuffer.buffer);
 
     // ---- Resource (Image) Heap ----
     // The resource heap holds image descriptors. We allocate enough slots for all application textures.
@@ -3380,7 +1408,11 @@ private:
 
     // Build arrays of descriptor info for all images, then write them in a single batched call.
     // Each struct chain must stay alive until the write: ResourceDescriptorInfo -> ImageDescriptorInfo -> ImageViewCreateInfo.
-    constexpr uint32_t                                  imageCount = 2;
+    //
+    // Contract: the array index of m_image[] *is* the heap slot index, *is*
+    // shaderio::SceneInfo::texId. Adding a new texture means appending to
+    // m_image[] -- no other place in the code needs to know the index.
+    constexpr uint32_t                                  imageCount = uint32_t(std::size(decltype(m_image){}));
     std::array<VkImageViewCreateInfo, imageCount>       viewInfos{};
     std::array<VkImageDescriptorInfoEXT, imageCount>    imageDescInfos{};
     std::array<VkResourceDescriptorInfoEXT, imageCount> resInfos{};
@@ -3420,6 +1452,7 @@ private:
     // Create the GPU buffer for the resource heap and upload the staging data
     m_resourceHeapBuffer = m_allocator.createBufferAndUploadData(cmd, std::span(resourceHeapData), heapUsage, {},
                                                                  heapProps.resourceHeapAlignment);
+    DBG_VK_NAME(m_resourceHeapBuffer.buffer);
 
     // Store heap metadata needed later for vkCmdBindSamplerHeapEXT / vkCmdBindResourceHeapEXT.
     // The bind info describes: total heap size, where the reserved range starts, and its size.
@@ -3433,7 +1466,7 @@ private:
 
   /*--
    * Create a descriptor pool for ImGui.
-   * ImGui still uses traditional descriptor sets for its font textures and GBuffer display textures.
+   * ImGui still uses traditional descriptor sets for its font textures and RenderTarget display textures.
    * The application's own textures/samplers use the descriptor heap instead (see createDescriptorHeap).
   -*/
   void createUIDescriptorPool()
@@ -3442,21 +1475,34 @@ private:
     vkGetPhysicalDeviceProperties2(m_context.getPhysicalDevice(), &deviceProperties2);
     const auto& deviceProperties = deviceProperties2.properties;
 
-    // ImGui creates a descriptor set for each single texture. Therefore the pool size must be large enough to hold all textures of all sets.
-    uint32_t uiPoolSize                 = std::min(20U, deviceProperties.limits.maxDescriptorSetSampledImages);
-    uint32_t maxDescriptorSets          = std::min(uiPoolSize, deviceProperties.limits.maxDescriptorSetUniformBuffers);
-    VkDescriptorPoolSize       poolSize = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, uiPoolSize};
-    VkDescriptorPoolCreateInfo poolInfo = {
-        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        .maxSets       = maxDescriptorSets,
-        .poolSizeCount = 1,
-        .pPoolSizes    = &poolSize,
+    // ImGui allocates one descriptor set per texture (fonts, RenderTarget display, every
+    // ImGui_ImplVulkan_AddTexture, plus extras for docking/viewports). Depending on
+    // the backend configuration, those sets can use COMBINED_IMAGE_SAMPLER, or a
+    // pair of SAMPLER + SAMPLED_IMAGE -- so we provision pool slots for all three.
+    // Sizes are clamped to device limits to stay safe on minimum-spec hardware.
+    constexpr uint32_t kPreferredUiSetCount = 128;
+    const uint32_t combinedSize = std::min(kPreferredUiSetCount, deviceProperties.limits.maxDescriptorSetSampledImages);
+    const uint32_t samplerSize  = std::min(kPreferredUiSetCount, deviceProperties.limits.maxDescriptorSetSamplers);
+    const uint32_t sampledImageSize = std::min(kPreferredUiSetCount, deviceProperties.limits.maxDescriptorSetSampledImages);
+    const uint32_t maxDescriptorSets = kPreferredUiSetCount;
+
+    const std::array<VkDescriptorPoolSize, 3> poolSizes = {{
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, combinedSize},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, samplerSize},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampledImageSize},
+    }};
+    const VkDescriptorPoolCreateInfo          poolInfo  = {
+                  .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                  .flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+                  .maxSets       = maxDescriptorSets,
+                  .poolSizeCount = uint32_t(poolSizes.size()),
+                  .pPoolSizes    = poolSizes.data(),
     };
 
     VK_CHECK(vkCreateDescriptorPool(m_context.getDevice(), &poolInfo, nullptr, &m_uiDescriptorPool));
     DBG_VK_NAME(m_uiDescriptorPool);
-    LOGI("Created UI descriptor pool: %u textures, %u sets", uiPoolSize, maxDescriptorSets);
+    LOGI("Created UI descriptor pool: %u sets (combined=%u, sampler=%u, sampledImage=%u)", maxDescriptorSets,
+         combinedSize, samplerSize, sampledImageSize);
   }
 
 
@@ -3468,8 +1514,8 @@ private:
   utils::ImageResource loadAndCreateImage(VkCommandBuffer cmd, const std::string& filename)
   {
     // Load the image from disk
-    int            w = 0, h = 0, comp = 0, req_comp{4};
-    const stbi_uc* data = stbi_load(filename.c_str(), &w, &h, &comp, req_comp);
+    int      w = 0, h = 0, comp = 0, req_comp{4};
+    stbi_uc* data = stbi_load(filename.c_str(), &w, &h, &comp, req_comp);
     ASSERT(data != nullptr, "Could not load texture image!");
     const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
 
@@ -3485,17 +1531,62 @@ private:
         .usage       = VK_IMAGE_USAGE_SAMPLED_BIT,
     };
 
-    // Use the VMA allocator to create the image
+    // Use the VMA allocator to create the image. createStagingBuffer copies the
+    // pixels into a GPU-mapped staging buffer synchronously, so we can free the
+    // stb_image allocation immediately after the call returns.
     const std::span dataSpan(data, w * h * 4);
     utils::ImageResource image = m_allocator.createImageAndUploadData(cmd, dataSpan, imageInfo, VK_IMAGE_LAYOUT_GENERAL);
-    DBG_VK_NAME(image.image);
+    stbi_image_free(data);  // stb_image data is now in the staging buffer; free the host copy.
+    utils::DebugUtil::getInstance().setObjectName(image.image, "Texture " + filename);
     image.extent = {uint32_t(w), uint32_t(h)};
     image.format = format;
 
     return image;
   }
 
-  // Creating the compute shader pipeline
+  /*--
+   * Creates the compute pipeline (traditional VkPipeline + VkPipelineLayout).
+   *
+   * Note the deliberate contrast with the graphics path:
+   *   - Graphics uses VK_EXT_shader_object: no VkPipeline, no pipeline layout,
+   *     descriptor heap access via VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT,
+   *     per-draw data sent via vkCmdPushDataEXT.
+   *   - Compute keeps the traditional model: a real VkPipelineLayout with a
+   *     VkPushConstantRange, populated at dispatch time with vkCmdPushConstants2.
+   *
+   * Why compute is NOT migrated to shader objects, even though VK_EXT_shader_object
+   * fully supports VK_SHADER_STAGE_COMPUTE_BIT:
+   *   1. Kkeeping one path on the traditional pattern shows both styles side-by-side. 
+   *      The traditional VkPipeline + VkPipelineLayout flow is still the most common 
+   *      shape in production code and most docs.
+   *   2. Compute does not benefit much from shader objects' main wins:
+   *        * Many dynamic states -- compute has no rasterization, blend, depth,
+   *          or vertex input state, so there is nothing to make dynamic.
+   *        * Mix-and-match shaders -- a compute "pipeline" is one shader; there
+   *          is nothing to swap.
+   *        * Layout-less story -- graphics earns it via the descriptor heap;
+   *          compute in this sample only needs a push-constant range, which
+   *          a normal pipeline layout already expresses cleanly.
+   *   3. Push constants stay tidier with a real layout: vkCmdPushConstants2 takes
+   *      a VkPipelineLayout. With shader objects you would need Maintenance6 (or
+   *      a separately created layout just for the push call) for zero gain here.
+   *
+   * If you want a reference for the shader-object compute path, the equivalent is:
+   *
+   *     VkShaderCreateInfoEXT info{
+   *         .sType                  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
+   *         .stage                  = VK_SHADER_STAGE_COMPUTE_BIT,
+   *         .codeType               = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+   *         .codeSize               = ...,
+   *         .pCode                  = ...,
+   *         .pName                  = "main",
+   *         .pushConstantRangeCount = 1,
+   *         .pPushConstantRanges    = &range,
+   *     };
+   *     vkCreateShadersEXT(device, 1, &info, nullptr, &m_computeShader);
+   *     // bind:    vkCmdBindShadersEXT(cmd, 1, &VK_SHADER_STAGE_COMPUTE_BIT, &m_computeShader);
+   *     // dispatch: vkCmdDispatch(...);
+  -*/
   void createComputeShaderPipeline()
   {
     // Create the pipeline layout used by the compute shader
@@ -3514,7 +1605,7 @@ private:
     DBG_VK_NAME(m_computePipelineLayout);
 
 // Creating the pipeline to run the compute shader
-#ifdef USE_SLANG
+#if USE_SLANG
     VkShaderModule compute = utils::createShaderModule(m_context.getDevice(), {shader_comp_slang, std::size(shader_comp_slang)});
 #else
     VkShaderModule compute = utils::createShaderModule(m_context.getDevice(), {shader_comp_glsl, std::size(shader_comp_glsl)});
@@ -3524,8 +1615,8 @@ private:
     /*-- 
      * Compute pipeline creation using VkPipelineCreateFlags2 (Maintenance5) 
     -*/
-    VkPipelineCreateFlags2CreateInfoKHR computeCreateFlags2{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
+    VkPipelineCreateFlags2CreateInfo computeCreateFlags2{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
         .flags = 0,  // No special flags needed for this simple compute pipeline
     };
 
@@ -3549,6 +1640,80 @@ private:
     vkDestroyShaderModule(m_context.getDevice(), compute, nullptr);
   }
 
+  /*---
+   * Prepare frame resources - the first step in the rendering process.
+   * It looks if the swapchain require rebuild, which happens when the window is resized.
+   * It acquires the image from the swapchain to render into.
+   * Returns true if we can proceed with rendering, false otherwise.
+  -*/
+  bool prepareFrameResources()
+  {
+    // Check if swapchain needs rebuilding (this internally calls vkQueueWaitIdle())
+    if(m_swapchain.needRebuilding())
+    {
+      m_windowSize = m_swapchain.reinitResources(m_vSync);
+    }
+
+    // Wait first, *then* acquire. Waiting on the timeline semaphore guarantees the
+    // GPU has released this slot's resources (command buffer, in-flight data) before
+    // we start reusing them. Acquiring first would mean we hold a swapchain image
+    // while still potentially racing the GPU on per-frame resources -- and in
+    // out-of-order presentation, the wrong slot's wait value would be in scope.
+    auto& frame = m_frameData[m_swapchain.getFrameResourceIndex()];
+
+    // Wait until GPU has finished processing the frame that was using these resources previously
+    // Note: If swapchain was rebuilt above, this wait is essentially a no-op since vkQueueWaitIdle() was already called
+    const VkSemaphoreWaitInfo waitInfo = {
+        .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+        .semaphoreCount = 1,
+        .pSemaphores    = &m_frameTimelineSemaphore,
+        .pValues        = &frame.lastSignalValue,
+    };
+    VK_CHECK(vkWaitSemaphores(m_context.getDevice(), &waitInfo, std::numeric_limits<uint64_t>::max()));
+#ifdef NVVK_SEMAPHORE_DEBUG
+    LOGI("WaitFrame: \t\t slot=%u waitValue=%llu", m_swapchain.getFrameResourceIndex(),
+         static_cast<unsigned long long>(frame.lastSignalValue));
+#endif
+
+    VkResult result = m_swapchain.acquireNextImage(m_context.getDevice());
+    return (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR);  // Continue only if we got a valid image
+  }
+
+  /*---
+   * Begin command buffer recording for the frame
+   * It resets the command pool to reuse the command buffer for recording new rendering commands for the current frame.
+   * Returns the command buffer for the frame.
+  -*/
+  VkCommandBuffer beginCommandRecording()
+  {
+    VkDevice device = m_context.getDevice();
+
+    // Get the frame data for the current in-flight slot (owned by Swapchain).
+    auto& frame = m_frameData[m_swapchain.getFrameResourceIndex()];
+
+    /*--
+     * Reset the whole command pool to reuse its command buffer for recording
+     * the current frame. An equivalent alternative is to create the pool with
+     * VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT and call
+     * vkResetCommandBuffer() per buffer; whole-pool reset is simpler when each
+     * pool only contains one buffer (as here).
+    -*/
+    VK_CHECK(vkResetCommandPool(device, frame.cmdPool, 0));
+    VkCommandBuffer cmd = frame.cmdBuffer;
+
+    // Begin the command buffer recording for the frame
+    const VkCommandBufferBeginInfo beginInfo{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
+
+    return cmd;
+  }
+
+  /*--
+   * End command buffer recording for the frame
+  -*/
+  void endCommandRecording(VkCommandBuffer cmd) { VK_CHECK(vkEndCommandBuffer(cmd)); }
+
   //--------------------------------------------------------------------------------------------------
   GLFWwindow* m_window{};  // The window
 
@@ -3558,21 +1723,27 @@ private:
   utils::Buffer            m_vertexBuffer;     // The vertex buffer (two triangles) (SSBO)
   utils::Buffer            m_pointsBuffer;     // The data buffer (SSBO)
   utils::Buffer            m_sceneInfoBuffer;  // Scene info GPU buffer, updated once per frame, accessed via BDA
-  utils::ImageResource     m_image[2];         // The loaded image
-  utils::SamplerPool       m_samplerPool;      // The sampler pool, used to create a sampler for the texture
+  // Loaded textures. The array index *is* the descriptor-heap slot index
+  // (== shaderio::SceneInfo::texId). Adding a texture is a one-place change:
+  // grow this array; createDescriptorHeap() picks up the new size automatically.
+  utils::ImageResource m_image[2];
+  utils::SamplerPool   m_samplerPool;  // The sampler pool, used to create a sampler for the texture
 
-  utils::Gbuffer m_gBuffer;  // The G-Buffer
+  utils::RenderTarget m_renderTarget;  // Offscreen color + depth target rendered into and shown via ImGui::Image
 
   VkSurfaceKHR m_surface{};               // The window surface
   VkExtent2D   m_windowSize{800, 600};    // The window size
   VkExtent2D   m_viewportSize{800, 600};  // The viewport area in the window
 
-  // No graphics pipeline layout (VK_NULL_HANDLE with descriptor heap + push data)
-  VkPipelineLayout m_computePipelineLayout{};           // The pipeline layout use with compute pipeline
-  VkPipeline       m_computePipeline{};                 // The compute pipeline
-  VkPipeline       m_graphicsPipelineWithTexture{};     // The graphics pipeline with texture
-  VkPipeline       m_graphicsPipelineWithoutTexture{};  // The graphics pipeline without texture
-  VkCommandPool    m_transientCmdPool{};                // The command pool
+  // Graphics: no pipeline / no pipeline layout. We use VK_EXT_shader_object instead.
+  VkShaderEXT m_vertShader{};           // Shared vertex shader
+  VkShaderEXT m_fragShaderTextured{};   // Fragment shader, useTexture spec const = TRUE
+  VkShaderEXT m_fragShaderNoTexture{};  // Fragment shader, useTexture spec const = FALSE
+
+  // Compute: traditional pipeline + layout (no descriptor heap access in compute).
+  VkPipelineLayout m_computePipelineLayout{};
+  VkPipeline       m_computePipeline{};
+  VkCommandPool    m_transientCmdPool{};
   VkDescriptorPool m_uiDescriptorPool{};  // ImGui descriptor pool (ImGui still uses traditional descriptor sets)
 
   // Descriptor heap (VK_EXT_descriptor_heap): replaces traditional descriptor sets for textures/samplers.
@@ -3598,74 +1769,13 @@ private:
   std::vector<FrameData> m_frameData;      // Collection of per-frame resources to support multiple frames in flight
   VkSemaphore m_frameTimelineSemaphore{};  // Timeline semaphore used to synchronize CPU submission with GPU completion
   uint64_t    m_frameCounter{1};           // Monotonic timeline counter (increments each frame)
-  uint32_t    m_frameRingCurrent{0};       // Current frame index in the ring buffer (cycles through available frames)
-  utils::FramePacer m_framePacer;          // Utility to pace the frame rate
+  // The swapchain owns the in-flight slot index; query it via m_swapchain.getFrameResourceIndex().
+  utils::FramePacer m_framePacer;  // Utility to pace the frame rate
 
   bool              m_vSync{true};                           // VSync on or off
   int               m_imageID{0};                            // The current image to display
   uint32_t          m_maxTextures{10000};                    // Maximum textures allowed in the application
   VkClearColorValue m_clearColor{{0.2f, 0.2f, 0.3f, 1.0f}};  // The clear color
-
-  /*---
-   * Prepare frame resources - the first step in the rendering process.
-   * It looks if the swapchain require rebuild, which happens when the window is resized.
-   * It acquires the image from the swapchain to render into.
-   * Returns true if we can proceed with rendering, false otherwise.
-  -*/
-  bool prepareFrameResources()
-  {
-    // Check if swapchain needs rebuilding (this internally calls vkQueueWaitIdle())
-    if(m_swapchain.needRebuilding())
-    {
-      m_windowSize = m_swapchain.reinitResources(m_vSync);
-    }
-
-    // Get the frame data for the current frame in the ring buffer
-    auto& frame = m_frameData[m_frameRingCurrent];
-
-    // Wait until GPU has finished processing the frame that was using these resources previously
-    // Note: If swapchain was rebuilt above, this wait is essentially a no-op since vkQueueWaitIdle() was already called
-    const VkSemaphoreWaitInfo waitInfo = {
-        .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-        .semaphoreCount = 1,
-        .pSemaphores    = &m_frameTimelineSemaphore,
-        .pValues        = &frame.lastSignalValue,
-    };
-    VK_CHECK(vkWaitSemaphores(m_context.getDevice(), &waitInfo, std::numeric_limits<uint64_t>::max()));
-#ifdef NVVK_SEMAPHORE_DEBUG
-    LOGI("WaitFrame: \t\t ring=%u waitValue=%llu", m_frameRingCurrent, static_cast<unsigned long long>(frame.lastSignalValue));
-#endif
-
-    VkResult result = m_swapchain.acquireNextImage(m_context.getDevice());
-    return (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR);  // Continue only if we got a valid image
-  }
-
-  /*---
-   * Begin command buffer recording for the frame
-   * It resets the command pool to reuse the command buffer for recording new rendering commands for the current frame.
-   * Returns the command buffer for the frame.
-  -*/
-  VkCommandBuffer beginCommandRecording()
-  {
-    VkDevice device = m_context.getDevice();
-
-    // Get the frame data for the current frame in the ring buffer
-    auto& frame = m_frameData[m_frameRingCurrent];
-
-    /*--
-     * Reset the command pool to reuse the command buffer for recording
-     * new rendering commands for the current frame.
-    -*/
-    VK_CHECK(vkResetCommandPool(device, frame.cmdPool, 0));
-    VkCommandBuffer cmd = frame.cmdBuffer;
-
-    // Begin the command buffer recording for the frame
-    const VkCommandBufferBeginInfo beginInfo{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
-
-    return cmd;
-  }
 };
 
 //--- Main ---------------------------------------------------------------------------------------------------------------

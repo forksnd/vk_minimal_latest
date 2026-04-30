@@ -12,7 +12,10 @@
 #
 # Creates an imported library, `Slang`, that can be linked against.
 
-set(Slang_VERSION "2025.13.1" CACHE STRING "Slang version. If you change this and ran CMake before, you will need to delete the other Slang_* cache variables")
+# Slang version. Bump this to track the latest Slang release (this sample is
+# meant to demonstrate the latest tooling). If you change this and have run
+# CMake before, delete the other Slang_* cache variables.
+set(Slang_VERSION "2026.5.2" CACHE STRING "Slang version")
 
 string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" ARCH_PROC)
 if(ARCH_PROC MATCHES "^(arm|aarch64)")

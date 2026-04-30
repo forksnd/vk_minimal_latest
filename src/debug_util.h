@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -29,7 +29,7 @@
 //
 // Example:
 // debugUtilInitialize(device);
-// VkBuffer buffer = createBufer(...)
+// VkBuffer buffer = createBuffer(...);
 // DBG_VK_NAME(buffer);
 //
 // void someFunction(VkCommandBuffer cmdBuf)
@@ -162,14 +162,30 @@ constexpr VkObjectType DebugUtil::getObjectType()
 
 #define DBG_VK_SCOPE(_cmd) utils::DebugUtil::ScopedCmdLabel scopedCmdLabel(_cmd, __FUNCTION__)
 
-#define DBG_VK_NAME(obj)                                                                                                       \
-  if(utils::DebugUtil::getInstance().isInitialized())                                                                          \
-  utils::DebugUtil::getInstance().setObjectName(                                                                               \
-      obj, std::string(std::max(std::max(typeid(*this).name(), strrchr(typeid(*this).name(), ' ') + 1), typeid(*this).name())) \
-               + "::" + #obj + " (" + std::string(" in ")                                                                      \
-               + std::max({__FILE__, strrchr(__FILE__, '\\') ? strrchr(__FILE__, '\\') + 1 : __FILE__,                         \
-                           strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__})                                    \
-               + ":" + std::to_string(__LINE__) + ")")
+namespace utils {
+// Helpers for DBG_VK_NAME: pick the final path component and the class-name
+// tail past any leading namespace / 'struct ' / 'class ' prefix emitted by
+// typeid(...).name().
+inline const char* dbgFilenameOnly(const char* path)
+{
+  const char* slash     = strrchr(path, '/');
+  const char* backslash = strrchr(path, '\\');
+  const char* sep       = (slash > backslash) ? slash : backslash;
+  return sep ? sep + 1 : path;
+}
+
+inline const char* dbgTypeNameTail(const char* typeidName)
+{
+  const char* lastSpace = strrchr(typeidName, ' ');
+  return lastSpace ? lastSpace + 1 : typeidName;
+}
+}  // namespace utils
+
+#define DBG_VK_NAME(obj)                                                                                               \
+  if(utils::DebugUtil::getInstance().isInitialized())                                                                  \
+  utils::DebugUtil::getInstance().setObjectName(obj, std::string(utils::dbgTypeNameTail(typeid(*this).name()))         \
+                                                         + "::" + #obj + " (in " + utils::dbgFilenameOnly(__FILE__)    \
+                                                         + ":" + std::to_string(__LINE__) + ")")
 
 
 inline void debugUtilInitialize(VkDevice device)

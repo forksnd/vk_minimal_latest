@@ -21,13 +21,16 @@ include(CompilerSlangShader)
 include(CompilerGlslShader)
 include(DownloadPackage)
 
-# Find or download Slang compiler
-set(Slang_VERSION "2026.5.2")
+# Find or download Slang compiler.
+# The version is defined in cmake/FindSlang.cmake (single source of truth);
+# bump it there whenever a newer Slang release is desired -- this sample is
+# intended to track the latest Vulkan and latest Slang.
 find_package(Slang REQUIRED)
 
 # Add the executable
-add_executable(${MYPROJ} 
-    src/minimal_latest.cpp 
+add_executable(${MYPROJ}
+    src/minimal_latest.cpp
+    src/vk_framework.h
     src/debug_util.h
     src/logger.h
     )
@@ -60,6 +63,9 @@ FetchContent_MakeAvailable(glfw)
 message(STATUS "GLFW ready at: ${glfw_SOURCE_DIR}")
 
 # Include GLM
+# Tracks master by design: this sample demonstrates latest Vulkan / latest
+# third-party state, so reproducibility takes a back seat to freshness.
+# If you fork this for production, pin to a released tag.
 message(STATUS "Fetching GLM...")
 FetchContent_Declare(
   glm
@@ -71,6 +77,9 @@ message(STATUS "GLM ready at: ${glm_SOURCE_DIR}")
 set_property(TARGET glm PROPERTY FOLDER "ThirdParty")
 
 # Include Volk
+# Tracks master intentionally: Volk's master follows the latest Vulkan SDK
+# headers, which is what this sample is meant to demonstrate. If you fork
+# this for production, pin to a specific vulkan-sdk-* tag.
 message(STATUS "Fetching Volk...")
 FetchContent_Declare(
   volk
@@ -82,6 +91,9 @@ message(STATUS "Volk ready at: ${volk_SOURCE_DIR}")
 set_property(TARGET volk PROPERTY FOLDER "ThirdParty")
 
 # Include VMA
+# Tracks master: VMA regularly adopts new Vulkan features (Maintenance4/5,
+# VK_EXT_memory_priority, etc.) that this sample may want to exercise.
+# If you fork this for production, pin to a released tag.
 message(STATUS "Fetching VulkanMemoryAllocator...")
 FetchContent_Declare(
   VulkanMemoryAllocator
@@ -165,18 +177,40 @@ target_include_directories(${MYPROJ} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 # This is necessary because we are using volk to load Vulkan functions
 target_compile_definitions(${MYPROJ} PRIVATE VK_NO_PROTOTYPES)
 
-# Option to use Slang shaders instead of GLSL (default: ON)
-option(USE_SLANG "Use Slang shaders instead of GLSL" ON)
-if(USE_SLANG)
-  target_compile_definitions(${MYPROJ} PRIVATE USE_SLANG)
+# Shader language selection.
+#
+# The canonical default (Slang) lives at the top of src/minimal_latest.cpp as
+# `#define USE_SLANG 1` -- the source file is the source of truth.
+#
+# This CMake option exists only so CI / power users can force the GLSL path
+# without editing source. Passing -DUSE_SLANG=OFF defines USE_SLANG=0 on the
+# command line, which the preprocessor guard in minimal_latest.cpp respects.
+#
+# CMake always compiles both Slang and GLSL shader sets; this flag only picks
+# which set the C++ includes and binds.
+option(USE_SLANG "Compile with Slang shaders (OFF = compile GLSL equivalents instead)" ON)
+if(NOT USE_SLANG)
+  target_compile_definitions(${MYPROJ} PRIVATE USE_SLANG=0)
 endif()
 
 
 #------------------------------------------------------------------------------------------------------------------------------
 # Compile shaders
-file(GLOB SHADER_SLANG_FILES "shaders/*.slang")
-file(GLOB SHADER_GLSL_FILES "shaders/*.glsl")
-file(GLOB SHADER_H_FILES "shaders/*.h")
+# Explicit lists (not file(GLOB ...)) so that adding/removing a shader requires
+# a CMakeLists.txt edit -- this guarantees CMake sees the change and avoids
+# stale build graphs when new files are added.
+set(SHADER_SLANG_FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.rast.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.comp.slang"
+)
+set(SHADER_GLSL_FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.vert.glsl"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.frag.glsl"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.comp.glsl"
+)
+set(SHADER_H_FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader_io.h"
+)
 
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_LIST_DIR}/_autogen")
 
@@ -210,23 +244,32 @@ target_include_directories(${MYPROJ} PRIVATE "${CMAKE_BINARY_DIR}")
 target_include_directories(${MYPROJ} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 
-# Copy .jpg image next to the executable
-file(GLOB IMAGE_FILE "${CMAKE_SOURCE_DIR}/resources/*.jpg")
+# Copy runtime texture images next to the executable. Explicit list (not
+# GLOB) so adding a new texture requires a CMakeLists edit and the build
+# graph stays consistent.
+set(RUNTIME_IMAGE_FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/image1.jpg"
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/image2.jpg"
+)
 add_custom_command(
   TARGET ${MYPROJ} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-  ${IMAGE_FILE} $<TARGET_FILE_DIR:${MYPROJ}>
+  ${RUNTIME_IMAGE_FILES} $<TARGET_FILE_DIR:${MYPROJ}>
 )
 
-# Set a default installation prefix
-set(CMAKE_INSTALL_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/_install" CACHE PATH "Default install path" FORCE)
+# Set a default installation prefix (only when the user did not pass one).
+# Using FORCE here would stomp on -DCMAKE_INSTALL_PREFIX=... from CI or
+# package managers on every re-configure.
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/_install" CACHE PATH "Default install path" FORCE)
+endif()
 
 # Define the installation directory for the executable
 install(TARGETS ${MYPROJ}
     RUNTIME DESTINATION bin
 )
 
-# Installing also the image
-install(FILES ${IMAGE_FILE}
+# Installing also the images
+install(FILES ${RUNTIME_IMAGE_FILES}
     DESTINATION bin
 )
